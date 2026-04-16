@@ -116,3 +116,32 @@ def split_train_val(
         val_samples = val_samples[-1:]
 
     return train_samples, val_samples
+
+
+def resolve_data_path(default_path: str | Path, alternative_path: str | Path | None = None) -> Path:
+    """
+    Resolve dataset paths with fallback support for multiple locations.
+
+    Priority:
+    1. alternative_path if provided and exists
+    2. default_path if it exists
+    3. default_path (return as-is for error reporting)
+
+    This allows users to have processed_data in different locations (e.g., for space reasons)
+    while keeping the config working for the whole team.
+
+    Args:
+        default_path: Primary path (e.g., 'processed_data/train' relative to project)
+        alternative_path: Optional alternative path to check first (e.g., '/Data/vianney.gauthier/processed_data/train')
+
+    Returns:
+        Resolved Path object pointing to the first existing path, or default_path if none exist.
+    """
+    default = Path(default_path).resolve()
+
+    if alternative_path is not None:
+        alternative = Path(alternative_path).resolve()
+        if alternative.exists():
+            return alternative
+
+    return default
