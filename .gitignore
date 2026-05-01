@@ -207,6 +207,7 @@ marimo/_lsp/
 __marimo__/
 
 data/
+!src/configs/data/
 outputs/
 *.pt
 processed_data/
