@@ -2,6 +2,6 @@
 # ResNet18 per frame + LSTM over time
 model:
   name: cnn_lstm
-  pretrained: true
+  pretrained: false
   num_classes: ${num_classes}
   lstm_hidden_size: 128
