@@ -1,0 +1,32 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [{ "type": "command", "command": "bash .claude/hooks/post_edit.sh" }]
+      }
+    ]
+  },
+  "permissions": {
+    "allow": [
+      "Bash(uv run pytest*)",
+      "Bash(uv run ruff check*)",
+      "Bash(uv run ruff format*)",
+      "Bash(python src/train.py*)",
+      "Bash(python src/evaluate.py*)",
+      "Bash(python src/create_submission.py*)",
+      "Bash(git diff --stat*)",
+      "Bash(git diff -- *)",
+      "Bash(git log*)",
+      "Bash(git status*)",
+      "Bash(ls*)",
+      "Bash(find *)",
+      "Bash(grep *)",
+      "Bash(head *)",
+      "Bash(wc*)",
+      "Bash(python3 -c *)",
+      "Bash(mkdir -p .claude/*)",
+      "Bash(rm -rf src/outputs/*)"
+    ]
+  }
+}

@@ -13,6 +13,15 @@ dependencies = [
     "pillow>=10.0.0",
 ]
 
+[dependency-groups]
+dev = [
+    "ruff>=0.4.0",
+    "pytest>=8.0.0",
+]
+
+[tool.ruff]
+line-length = 120
+
 [tool.uv]
 package = false
 
