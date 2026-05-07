@@ -1,0 +1,8 @@
+# @package _global_
+# TSM ResNet-50: temporal shift module wrapping every residual block.
+# n_segment must equal dataset.num_frames.
+model:
+  name: tsm
+  num_classes: ${num_classes}
+  n_segment: ${dataset.num_frames}
+  dropout: 0.5
