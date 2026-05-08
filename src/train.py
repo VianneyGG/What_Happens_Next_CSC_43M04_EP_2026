@@ -60,6 +60,18 @@ def build_model(cfg: DictConfig) -> nn.Module:
             dropout=float(cfg.model.get("dropout", 0.5)),
         )
 
+    if name == "uniformer":
+        from models.uniformer import UniFormerB
+        return UniFormerB(
+            num_classes=int(num_classes),
+            depths=list(cfg.model.get("depths", [5, 8, 20, 7])),
+            dims=list(cfg.model.get("dims", [64, 128, 320, 512])),
+            num_heads=list(cfg.model.get("num_heads", [2, 4, 10, 16])),
+            mlp_ratio=float(cfg.model.get("mlp_ratio", 4.0)),
+            drop_path_rate=float(cfg.model.get("drop_path_rate", 0.3)),
+            window_size=list(cfg.model.get("window_size", [4, 7, 7])),
+        )
+
     raise ValueError(f"Unknown model.name: {name!r}")
 
 
@@ -78,6 +90,14 @@ def build_optimizer(model: nn.Module, cfg: DictConfig) -> torch.optim.Optimizer:
             momentum=float(cfg.training.get("momentum", 0.9)),
             weight_decay=float(cfg.training.get("weight_decay", 1e-4)),
             nesterov=bool(cfg.training.get("nesterov", True)),
+        )
+
+    if opt_name == "adamw":
+        return torch.optim.AdamW(
+            model.parameters(),
+            lr=lr,
+            betas=(0.9, 0.999),
+            weight_decay=float(cfg.training.get("weight_decay", 0.05)),
         )
 
     # default: adam
@@ -124,32 +144,48 @@ def train_one_epoch(
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     scaler: Optional[torch.cuda.amp.GradScaler],
+    grad_clip: float = 0.0,
+    accum_steps: int = 1,
 ) -> Tuple[float, float]:
     model.train()
     running_loss = 0.0
     correct = 0
     total = 0
 
-    for video_batch, labels in data_loader:
+    optimizer.zero_grad()
+    for step, (video_batch, labels) in enumerate(data_loader):
         video_batch = video_batch.to(device)
         labels = labels.to(device)
-
-        optimizer.zero_grad()
+        is_last = (step == len(data_loader) - 1)
 
         if scaler is not None:
-            with torch.cuda.amp.autocast():
+            with torch.amp.autocast("cuda"):
                 logits = model(video_batch)
-                loss = loss_fn(logits, labels)
+                loss = loss_fn(logits, labels) / accum_steps
             scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
         else:
             logits = model(video_batch)
-            loss = loss_fn(logits, labels)
+            loss = loss_fn(logits, labels) / accum_steps
             loss.backward()
-            optimizer.step()
 
-        running_loss += float(loss.item()) * labels.size(0)
+        # Unscaled loss for logging
+        running_loss += float(loss.item()) * accum_steps * labels.size(0)
+
+        if (step + 1) % accum_steps == 0 or is_last:
+            if scaler is not None:
+                if grad_clip > 0.0:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                if grad_clip > 0.0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                optimizer.step()
+            optimizer.zero_grad()
+
+        correct += int((logits.argmax(dim=1) == labels).sum().item())
+        total += labels.size(0)
         correct += int((logits.argmax(dim=1) == labels).sum().item())
         total += labels.size(0)
 
@@ -174,7 +210,7 @@ def evaluate_epoch(
         labels = labels.to(device)
 
         if scaler is not None:
-            with torch.cuda.amp.autocast():
+            with torch.amp.autocast("cuda"):
                 logits = model(video_batch)
                 loss = loss_fn(logits, labels)
         else:
@@ -258,18 +294,22 @@ def main(cfg: DictConfig) -> None:
     scheduler = build_scheduler(optimizer, cfg, steps_per_epoch=len(train_loader))
 
     use_amp = bool(cfg.training.get("use_amp", False)) and device.type == "cuda"
-    scaler = torch.cuda.amp.GradScaler() if use_amp else None
+    scaler = torch.amp.GradScaler("cuda") if use_amp else None
 
     label_smoothing = float(cfg.training.get("label_smoothing", 0.0))
     loss_fn = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
+    grad_clip = float(cfg.training.get("grad_clip", 0.0))
+    accum_steps = int(cfg.training.get("accum_steps", 1))
 
     # --- Training loop ---
     best_val_accuracy = 0.0
     checkpoint_path = Path(cfg.training.checkpoint_path).resolve()
+    patience = int(cfg.training.get("early_stopping_patience", 0))
+    epochs_without_improvement = 0
 
     for epoch in range(int(cfg.training.epochs)):
         train_loss, train_acc = train_one_epoch(
-            model, train_loader, loss_fn, optimizer, device, scaler
+            model, train_loader, loss_fn, optimizer, device, scaler, grad_clip, accum_steps
         )
         val_loss, val_acc = evaluate_epoch(
             model, val_loader, loss_fn, device, scaler
@@ -286,6 +326,7 @@ def main(cfg: DictConfig) -> None:
 
         if val_acc > best_val_accuracy:
             best_val_accuracy = val_acc
+            epochs_without_improvement = 0
             payload: Dict[str, Any] = {
                 "model_state_dict": model.state_dict(),
                 "model_name": cfg.model.name,
@@ -302,6 +343,11 @@ def main(cfg: DictConfig) -> None:
 
             torch.save(payload, checkpoint_path)
             print(f"  Saved best model (val acc={val_acc:.4f}) -> {checkpoint_path}")
+        else:
+            epochs_without_improvement += 1
+            if patience > 0 and epochs_without_improvement >= patience:
+                print(f"  Early stopping: no improvement for {patience} epochs.")
+                break
 
     print(f"Done. Best validation accuracy: {best_val_accuracy:.4f}")
 

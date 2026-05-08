@@ -58,7 +58,7 @@ class TemporalShift(nn.Module):
 def _wrap_stage(stage: nn.Sequential, n_segment: int) -> nn.Sequential:
     """Wrap every residual block in a ResNet stage with TemporalShift."""
     return nn.Sequential(*[
-        TemporalShift(block, n_segment=n_segment, fold_div=8)
+        TemporalShift(block, n_segment=n_segment, fold_div=4)
         for block in stage.children()
     ])
 
