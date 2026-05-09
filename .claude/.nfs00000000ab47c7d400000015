@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import json; json.load\\(open\\('.claude/settings.json'\\)\\); print\\('settings.json valid'\\)\")",
+      "WebSearch",
+      "Bash(chmod +x *)",
+      "Bash(python3 -m json.tool .claude/settings.json)",
+      "Bash(git reset *)"
+    ]
+  }
+}

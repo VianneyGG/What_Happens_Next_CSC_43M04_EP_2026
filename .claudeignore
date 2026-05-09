@@ -1,0 +1,28 @@
+# Python environment — never useful to read
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Lock files — large, useless to read
+uv.lock
+*.lock
+
+# Binary model checkpoints
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.safetensors
+
+# Hydra outputs — accumulate with each training run
+src/outputs/
+
+# Git internals
+.git/
+
+# Raw data — too large, paths come from config
+/Data/
+
+# Prompt engineering artifacts
+.prompts/

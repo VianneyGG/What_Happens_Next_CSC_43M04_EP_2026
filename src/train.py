@@ -15,8 +15,12 @@ split; the dedicated ``dataset.val_dir`` is for ``evaluate.py`` only.
 
 from __future__ import annotations
 
+import json
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Tuple
+
+REPO_ROOT = Path(__file__).parent.parent
 
 import hydra
 import torch
@@ -216,6 +220,23 @@ def main(cfg: DictConfig) -> None:
             )
 
     print(f"Done. Best validation accuracy: {best_val_accuracy:.4f}")
+
+    results_dir = REPO_ROOT / ".claude" / "results"
+    results_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    result = {
+        "timestamp": timestamp,
+        "experiment": cfg.model.name,
+        "best_val_accuracy": round(float(best_val_accuracy), 4),
+        "epochs_trained": int(cfg.training.epochs),
+        "lr": float(cfg.training.lr),
+        "batch_size": int(cfg.training.batch_size),
+        "num_frames": int(cfg.dataset.num_frames),
+        "warning": "TOP1_LOW" if best_val_accuracy < 0.5 else None,
+    }
+    result_path = results_dir / f"{timestamp}-{cfg.model.name}.json"
+    result_path.write_text(json.dumps(result, indent=2))
+    print(f"Results → {result_path}")
 
 
 if __name__ == "__main__":

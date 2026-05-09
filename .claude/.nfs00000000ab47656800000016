@@ -1,23 +1,9 @@
 {
   "hooks": {
-    "PreToolUse": [
-      {
-        "matcher": "Bash",
-        "hooks": [{ "type": "command", "command": "bash .claude/hooks/pre_bash.sh" }]
-      },
-      {
-        "matcher": "Read",
-        "hooks": [{ "type": "command", "command": "bash .claude/hooks/pre_read.sh" }]
-      }
-    ],
     "PostToolUse": [
       {
         "matcher": "Write|Edit",
         "hooks": [{ "type": "command", "command": "bash .claude/hooks/post_edit.sh" }]
-      },
-      {
-        "matcher": "Bash",
-        "hooks": [{ "type": "command", "command": "bash .claude/hooks/post_train.sh" }]
       }
     ]
   },
@@ -40,13 +26,7 @@
       "Bash(wc*)",
       "Bash(python3 -c *)",
       "Bash(mkdir -p .claude/*)",
-      "Bash(rm -rf src/outputs/*)",
-      "Bash(cp .claude/context/* .claude/rules/*)"
-    ],
-    "deny": [
-      "Bash(git push*)",
-      "Bash(git push --force*)",
-      "Write(**/.env*)"
+      "Bash(rm -rf src/outputs/*)"
     ]
   }
 }
