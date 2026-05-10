@@ -1,0 +1,20 @@
+# @package _global_
+# WebDataset streaming config.
+# Shards are served locally by the HTTP server started by launch_distributed.py,
+# and forwarded to each GPU node via SSH reverse tunnel on port 9888.
+#
+# Run conversion first:
+#   uv run python src/misc/convert_to_webdataset.py \
+#     --input_dir processed_data --output_dir processed_data_wds
+#
+# Then update the shard range below to match the actual shard count printed by the script.
+# E.g. if conversion prints "train: 90 shards", use {000000..000089}.
+
+dataset:
+  train_shards: "http://localhost:9888/train/shard-{000000..000089}.tar"
+  val_shards: "http://localhost:9888/val/shard-{000000..000009}.tar"
+  num_frames: 4
+  val_ratio: 0.2
+  seed: 42
+  max_samples: null
+  streaming: true

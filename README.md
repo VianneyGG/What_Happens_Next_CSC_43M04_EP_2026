@@ -143,6 +143,67 @@ video_12345,7
 
 `evaluate.py` and `create_submission.py` do **not** need edits: they call `build_model` with the config saved in your checkpoint.
 
+## Distributed training (multi-node)
+
+The launcher in `scripts/launch_distributed.py` SSHes into each node and starts `torchrun` with the c10d rendezvous backend. Requires passwordless SSH from your local machine to every node.
+
+```bash
+python scripts/launch_distributed.py \
+  --hosts scripts/hosts.txt \
+  --gpus_per_node 8 \
+  -- experiment=baseline_from_scratch data=vianney
+```
+
+`scripts/hosts.txt` — one SSH target per line (first line becomes the rendezvous master):
+
+```text
+user@node0.cluster
+user@node1.cluster
+```
+
+Single-node multi-GPU (no SSH needed):
+
+```bash
+torchrun --nproc_per_node=4 src/train.py experiment=baseline_from_scratch data=vianney
+```
+
+### WebDataset streaming (no data copy to remote nodes)
+
+When the dataset lives only on your local machine, convert it once to WebDataset tar shards, then let the launcher serve them over HTTP via an SSH reverse tunnel — each remote node reads `http://localhost:9888/` which is transparently forwarded back to your machine.
+
+**1. Convert once (local):**
+
+```bash
+uv run python src/misc/convert_to_webdataset.py \
+  --input_dir processed_data \
+  --output_dir processed_data_wds \
+  --shard_size 500
+```
+
+Update the shard ranges in `src/configs/data/vianney_wds.yaml` to match the counts printed by the script (e.g. `{000000..000089}` for 90 train shards).
+
+**2. Launch with streaming:**
+
+```bash
+python scripts/launch_distributed.py \
+  --hosts scripts/hosts.txt \
+  --gpus_per_node 8 \
+  --wds_dir processed_data_wds \
+  -- experiment=baseline_from_scratch data=vianney_wds
+```
+
+The launcher starts a local HTTP server (`--http_port 8888`, default) and adds `-R 9888:localhost:8888` to each SSH connection so remote nodes read shards from `http://localhost:9888/`.
+
+**3. Distributed evaluation:**
+
+```bash
+python scripts/launch_distributed.py \
+  --hosts scripts/hosts.txt \
+  --gpus_per_node 8 \
+  --script src/evaluate.py \
+  -- training.checkpoint_path=src/best_model.pt data=vianney_wds
+```
+
 ## Tips
 
 - Set `training.device=cuda` when a GPU is available; use `cpu` otherwise.

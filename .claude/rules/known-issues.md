@@ -10,7 +10,7 @@ Training requires a CUDA-capable GPU. CPU-only runs will OOM or be prohibitively
 
 ### Data location
 
-Frames live at `/Data/vianney.gauthier/processed_data/val2/`. On a different machine, update `src/configs/data/vianney.yaml` only — do NOT modify `default.yaml`.
+Frames live at `/Data/vianney.gauthier/processed_data/`. On a different machine, update `src/configs/data/vianney.yaml` only — do NOT modify `default.yaml`.
 
 ### Hydra outputs
 

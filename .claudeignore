@@ -23,6 +23,7 @@ src/outputs/
 
 # Raw data — too large, paths come from config
 /Data/
+processed_data/
 
 # Prompt engineering artifacts
 .prompts/

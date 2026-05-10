@@ -1,0 +1,14 @@
+# SSH hosts for distributed training — one hostname or IP per line.
+# Lines starting with '#' are ignored.
+#
+# The FIRST non-comment line becomes the rendezvous master (rdzv_endpoint).
+# All nodes must have passwordless SSH access from the machine running launch_distributed.py.
+# All nodes must have the repo cloned to the same --workdir path.
+#
+# Example:
+# node0.mycluster.local
+# node1.mycluster.local
+# 192.168.1.10
+# 192.168.1.11
+vianney.gauthier@bugatti.polytechnique.fr
+vianney.gauthier@islande.polytechnique.fr

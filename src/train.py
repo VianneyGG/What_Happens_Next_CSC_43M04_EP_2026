@@ -12,11 +12,16 @@ add more overrides). You can still override any key, e.g. ``training.epochs=10``
 
 Training uses ``dataset.train_dir`` and ``split_train_val`` for an internal train/val
 split; the dedicated ``dataset.val_dir`` is for ``evaluate.py`` only.
+
+Multi-node distributed training (torchrun):
+    torchrun --nproc_per_node=4 train.py experiment=baseline_from_scratch +data=vianney
+    # or use scripts/launch_distributed.py for multi-node SSH dispatch
 """
 
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime
 import math
 from pathlib import Path
@@ -26,9 +31,12 @@ REPO_ROOT = Path(__file__).parent.parent
 
 import hydra
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from omegaconf import DictConfig, OmegaConf
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 
 from dataset.video_dataset import VideoFrameDataset, collect_video_samples
 from models.cnn_baseline import CNNBaseline
@@ -147,7 +155,7 @@ def train_one_epoch(
     loss_fn: nn.Module,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
-    scaler: Optional[torch.cuda.amp.GradScaler],
+    scaler: Optional[torch.cuda.amp.GradScaler] = None,
     grad_clip: float = 0.0,
     accum_steps: int = 1,
 ) -> Tuple[float, float]:
@@ -160,7 +168,10 @@ def train_one_epoch(
     for step, (video_batch, labels) in enumerate(data_loader):
         video_batch = video_batch.to(device)
         labels = labels.to(device)
-        is_last = (step == len(data_loader) - 1)
+        try:
+            is_last = (step == len(data_loader) - 1)
+        except TypeError:
+            is_last = False  # IterableDataset (streaming) has no len()
 
         if scaler is not None:
             with torch.amp.autocast("cuda"):
@@ -172,7 +183,6 @@ def train_one_epoch(
             loss = loss_fn(logits, labels) / accum_steps
             loss.backward()
 
-        # Unscaled loss for logging
         running_loss += float(loss.item()) * accum_steps * labels.size(0)
 
         if (step + 1) % accum_steps == 0 or is_last:
@@ -190,8 +200,6 @@ def train_one_epoch(
 
         correct += int((logits.argmax(dim=1) == labels).sum().item())
         total += labels.size(0)
-        correct += int((logits.argmax(dim=1) == labels).sum().item())
-        total += labels.size(0)
 
     return running_loss / max(total, 1), correct / max(total, 1)
 
@@ -202,7 +210,7 @@ def evaluate_epoch(
     data_loader: DataLoader,
     loss_fn: nn.Module,
     device: torch.device,
-    scaler: Optional[torch.cuda.amp.GradScaler],
+    scaler: Optional[torch.cuda.amp.GradScaler] = None,
 ) -> Tuple[float, float]:
     model.eval()
     running_loss = 0.0
@@ -234,68 +242,118 @@ def evaluate_epoch(
 
 @hydra.main(version_base=None, config_path="configs", config_name="config")
 def main(cfg: DictConfig) -> None:
-    print(OmegaConf.to_yaml(cfg))
+    # --- Distributed setup ---
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    rank = int(os.environ.get("RANK", 0))
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    is_dist = world_size > 1
 
-    set_seed(int(cfg.dataset.seed))
+    if is_dist:
+        dist.init_process_group(backend=cfg.training.get("dist_backend", "nccl"))
+
+    if rank == 0:
+        print(OmegaConf.to_yaml(cfg))
+
+    # Different seed per rank ensures independent data augmentation
+    set_seed(int(cfg.dataset.seed) + rank)
 
     device_str = cfg.training.device
     if device_str == "cuda" and not torch.cuda.is_available():
-        print("CUDA not available; falling back to CPU.")
+        if rank == 0:
+            print("CUDA not available; falling back to CPU.")
         device_str = "cpu"
-    device = torch.device(device_str)
+
+    if device_str == "cuda":
+        torch.cuda.set_device(local_rank)
+        device = torch.device(f"cuda:{local_rank}")
+    else:
+        device = torch.device(device_str)
 
     # --- Data ---
-    train_dir = Path(cfg.dataset.train_dir).resolve()
-    all_samples = collect_video_samples(train_dir)
-
-    max_samples = cfg.dataset.get("max_samples")
-    if max_samples is not None:
-        all_samples = all_samples[: int(max_samples)]
-
-    train_samples, val_samples = split_train_val(
-        all_samples,
-        val_ratio=float(cfg.dataset.val_ratio),
-        seed=int(cfg.dataset.seed),
-    )
-
     use_imagenet_norm = bool(cfg.model.get("pretrained", False))
-    train_transform = build_transforms(is_training=True, use_imagenet_norm=use_imagenet_norm)
-    eval_transform = build_transforms(is_training=False, use_imagenet_norm=use_imagenet_norm)
-
     num_frames = int(cfg.dataset.num_frames)
+    train_sampler = None  # overridden below for non-streaming DDP
 
-    train_dataset = VideoFrameDataset(
-        root_dir=train_dir,
-        num_frames=num_frames,
-        transform=train_transform,
-        sample_list=train_samples,
-    )
-    val_dataset = VideoFrameDataset(
-        root_dir=train_dir,
-        num_frames=num_frames,
-        transform=eval_transform,
-        sample_list=val_samples,
-    )
+    if cfg.dataset.get("streaming", False):
+        from dataset.streaming_dataset import make_streaming_loader
+        train_loader = make_streaming_loader(
+            shard_pattern=cfg.dataset.train_shards,
+            num_frames=num_frames,
+            transform=build_transforms(is_training=True, use_imagenet_norm=use_imagenet_norm),
+            batch_size=int(cfg.training.batch_size),
+            num_workers=int(cfg.training.num_workers),
+            is_train=True,
+        )
+        val_loader = make_streaming_loader(
+            shard_pattern=cfg.dataset.val_shards,
+            num_frames=num_frames,
+            transform=build_transforms(is_training=False, use_imagenet_norm=use_imagenet_norm),
+            batch_size=int(cfg.training.batch_size),
+            num_workers=int(cfg.training.num_workers),
+            is_train=False,
+        )
+    else:
+        train_dir = Path(cfg.dataset.train_dir).resolve()
+        all_samples = collect_video_samples(train_dir)
 
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=int(cfg.training.batch_size),
-        shuffle=True,
-        num_workers=int(cfg.training.num_workers),
-        pin_memory=(device.type == "cuda"),
-    )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=int(cfg.training.batch_size),
-        shuffle=False,
-        num_workers=int(cfg.training.num_workers),
-        pin_memory=(device.type == "cuda"),
-    )
+        max_samples = cfg.dataset.get("max_samples")
+        if max_samples is not None:
+            all_samples = all_samples[: int(max_samples)]
+
+        train_samples, val_samples = split_train_val(
+            all_samples,
+            val_ratio=float(cfg.dataset.val_ratio),
+            seed=int(cfg.dataset.seed),
+        )
+
+        train_dataset = VideoFrameDataset(
+            root_dir=train_dir,
+            num_frames=num_frames,
+            transform=build_transforms(is_training=True, use_imagenet_norm=use_imagenet_norm),
+            sample_list=train_samples,
+        )
+        val_dataset = VideoFrameDataset(
+            root_dir=train_dir,
+            num_frames=num_frames,
+            transform=build_transforms(is_training=False, use_imagenet_norm=use_imagenet_norm),
+            sample_list=val_samples,
+        )
+
+        train_sampler = DistributedSampler(
+            train_dataset, num_replicas=world_size, rank=rank, shuffle=True
+        ) if is_dist else None
+        val_sampler = DistributedSampler(
+            val_dataset, num_replicas=world_size, rank=rank, shuffle=False
+        ) if is_dist else None
+
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=int(cfg.training.batch_size),
+            shuffle=(train_sampler is None),
+            sampler=train_sampler,
+            num_workers=int(cfg.training.num_workers),
+            pin_memory=(device.type == "cuda"),
+        )
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=int(cfg.training.batch_size),
+            shuffle=False,
+            sampler=val_sampler,
+            num_workers=int(cfg.training.num_workers),
+            pin_memory=(device.type == "cuda"),
+        )
 
     # --- Model / optimizer / scheduler ---
     model = build_model(cfg).to(device)
+    if is_dist:
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+
     optimizer = build_optimizer(model, cfg)
-    scheduler = build_scheduler(optimizer, cfg, steps_per_epoch=len(train_loader))
+    try:
+        steps_per_epoch = len(train_loader)
+    except TypeError:
+        steps_per_epoch = 0  # streaming IterableDataset has no len()
+    scheduler = build_scheduler(optimizer, cfg, steps_per_epoch=steps_per_epoch)
 
     use_amp = bool(cfg.training.get("use_amp", False)) and device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda") if use_amp else None
@@ -312,65 +370,82 @@ def main(cfg: DictConfig) -> None:
     epochs_without_improvement = 0
 
     for epoch in range(int(cfg.training.epochs)):
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
+
         train_loss, train_acc = train_one_epoch(
             model, train_loader, loss_fn, optimizer, device, scaler, grad_clip, accum_steps
         )
-        val_loss, val_acc = evaluate_epoch(
-            model, val_loader, loss_fn, device, scaler
-        )
+        val_loss, val_acc = evaluate_epoch(model, val_loader, loss_fn, device, scaler)
+
+        # Average metrics across all ranks for consistent logging and checkpoint decisions
+        if is_dist:
+            metrics = torch.tensor([train_loss, train_acc, val_loss, val_acc], device=device)
+            dist.all_reduce(metrics, op=dist.ReduceOp.SUM)
+            metrics /= world_size
+            train_loss, train_acc, val_loss, val_acc = metrics.tolist()
 
         if scheduler is not None:
             scheduler.step()
 
-        print(
-            f"Epoch {epoch + 1}/{cfg.training.epochs} | "
-            f"train loss {train_loss:.4f} acc {train_acc:.4f} | "
-            f"val loss {val_loss:.4f} acc {val_acc:.4f}"
-        )
+        if rank == 0:
+            print(
+                f"Epoch {epoch + 1}/{cfg.training.epochs} | "
+                f"train loss {train_loss:.4f} acc {train_acc:.4f} | "
+                f"val loss {val_loss:.4f} acc {val_acc:.4f}"
+            )
 
         if val_acc > best_val_accuracy:
             best_val_accuracy = val_acc
             epochs_without_improvement = 0
-            payload: Dict[str, Any] = {
-                "model_state_dict": model.state_dict(),
-                "model_name": cfg.model.name,
-                "num_classes": int(cfg.model.num_classes),
-                "num_frames": num_frames,
-                "val_accuracy": val_acc,
-                "config": OmegaConf.to_container(cfg, resolve=True),
-            }
-            # backward-compat fields for existing loaders
-            if cfg.model.name in ("cnn_baseline", "cnn_lstm"):
-                payload["pretrained"] = bool(cfg.model.get("pretrained", False))
-            if cfg.model.name == "cnn_lstm":
-                payload["lstm_hidden_size"] = int(cfg.model.get("lstm_hidden_size", 512))
+            if rank == 0:
+                raw_model = model.module if is_dist else model
+                payload: Dict[str, Any] = {
+                    "model_state_dict": raw_model.state_dict(),
+                    "model_name": cfg.model.name,
+                    "num_classes": int(cfg.model.num_classes),
+                    "num_frames": num_frames,
+                    "val_accuracy": val_acc,
+                    "config": OmegaConf.to_container(cfg, resolve=True),
+                }
+                # backward-compat fields for existing loaders
+                if cfg.model.name in ("cnn_baseline", "cnn_lstm"):
+                    payload["pretrained"] = bool(cfg.model.get("pretrained", False))
+                if cfg.model.name == "cnn_lstm":
+                    payload["lstm_hidden_size"] = int(cfg.model.get("lstm_hidden_size", 512))
 
-            torch.save(payload, checkpoint_path)
-            print(f"  Saved best model (val acc={val_acc:.4f}) -> {checkpoint_path}")
+                torch.save(payload, checkpoint_path)
+                print(f"  Saved best model (val acc={val_acc:.4f}) -> {checkpoint_path}")
         else:
             epochs_without_improvement += 1
             if patience > 0 and epochs_without_improvement >= patience:
-                print(f"  Early stopping: no improvement for {patience} epochs.")
+                if rank == 0:
+                    print(f"  Early stopping: no improvement for {patience} epochs.")
                 break
 
-    print(f"Done. Best validation accuracy: {best_val_accuracy:.4f}")
+    if rank == 0:
+        print(f"Done. Best validation accuracy: {best_val_accuracy:.4f}")
 
-    results_dir = REPO_ROOT / ".claude" / "results"
-    results_dir.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    result = {
-        "timestamp": timestamp,
-        "experiment": cfg.model.name,
-        "best_val_accuracy": round(float(best_val_accuracy), 4),
-        "epochs_trained": int(cfg.training.epochs),
-        "lr": float(cfg.training.lr),
-        "batch_size": int(cfg.training.batch_size),
-        "num_frames": int(cfg.dataset.num_frames),
-        "warning": "TOP1_LOW" if best_val_accuracy < 0.5 else None,
-    }
-    result_path = results_dir / f"{timestamp}-{cfg.model.name}.json"
-    result_path.write_text(json.dumps(result, indent=2))
-    print(f"Results → {result_path}")
+        results_dir = REPO_ROOT / ".claude" / "results"
+        results_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        result = {
+            "timestamp": timestamp,
+            "experiment": cfg.model.name,
+            "best_val_accuracy": round(float(best_val_accuracy), 4),
+            "epochs_trained": int(cfg.training.epochs),
+            "lr": float(cfg.training.lr),
+            "batch_size": int(cfg.training.batch_size),
+            "num_frames": int(cfg.dataset.num_frames),
+            "world_size": world_size,
+            "warning": "TOP1_LOW" if best_val_accuracy < 0.5 else None,
+        }
+        result_path = results_dir / f"{timestamp}-{cfg.model.name}.json"
+        result_path.write_text(json.dumps(result, indent=2))
+        print(f"Results → {result_path}")
+
+    if is_dist:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

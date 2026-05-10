@@ -10,13 +10,16 @@ Example (from ``src/``)::
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any, Dict
 
 import hydra
 import torch
+import torch.distributed as dist
 from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 
 from dataset.video_dataset import VideoFrameDataset, collect_video_samples
 from train import build_model
@@ -45,15 +48,31 @@ def load_model_from_checkpoint(checkpoint: Dict[str, Any], device: torch.device)
 
 @hydra.main(version_base=None, config_path="configs", config_name="config")
 def main(cfg: DictConfig) -> None:
-    print(OmegaConf.to_yaml(cfg))
+    # --- Distributed setup ---
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    rank = int(os.environ.get("RANK", 0))
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    is_dist = world_size > 1
+
+    if is_dist:
+        dist.init_process_group(backend=cfg.training.get("dist_backend", "nccl"))
+
+    if rank == 0:
+        print(OmegaConf.to_yaml(cfg))
 
     set_seed(int(cfg.dataset.seed))
 
     device_str = cfg.training.device
     if device_str == "cuda" and not torch.cuda.is_available():
-        print("CUDA not available; using CPU.")
+        if rank == 0:
+            print("CUDA not available; using CPU.")
         device_str = "cpu"
-    device = torch.device(device_str)
+
+    if device_str == "cuda":
+        torch.cuda.set_device(local_rank)
+        device = torch.device(f"cuda:{local_rank}")
+    else:
+        device = torch.device(device_str)
 
     checkpoint_path = Path(cfg.training.checkpoint_path).resolve()
     raw: Dict[str, Any] = torch.load(checkpoint_path, map_location=device)
@@ -79,10 +98,15 @@ def main(cfg: DictConfig) -> None:
         sample_list=val_samples,
     )
 
+    val_sampler = DistributedSampler(
+        val_dataset, num_replicas=world_size, rank=rank, shuffle=False
+    ) if is_dist else None
+
     val_loader = DataLoader(
         val_dataset,
         batch_size=int(cfg.training.batch_size),
         shuffle=False,
+        sampler=val_sampler,
         num_workers=int(cfg.training.num_workers),
         pin_memory=(device.type == "cuda"),
     )
@@ -109,12 +133,22 @@ def main(cfg: DictConfig) -> None:
 
             total += labels.size(0)
 
-    top1_accuracy = correct_top1 / max(total, 1)
-    top5_accuracy = correct_top5 / max(total, 1)
+    # Reduce counts across all ranks for exact global accuracy
+    if is_dist:
+        counts = torch.tensor([correct_top1, correct_top5, total], dtype=torch.int64, device=device)
+        dist.all_reduce(counts, op=dist.ReduceOp.SUM)
+        correct_top1, correct_top5, total = counts.tolist()
 
-    print(f"Validation samples: {len(val_dataset)}")
-    print(f"Top-1 accuracy: {top1_accuracy:.4f}")
-    print(f"Top-5 accuracy: {top5_accuracy:.4f}")
+    if rank == 0:
+        top1_accuracy = correct_top1 / max(total, 1)
+        top5_accuracy = correct_top5 / max(total, 1)
+
+        print(f"Validation samples: {total}")
+        print(f"Top-1 accuracy: {top1_accuracy:.4f}")
+        print(f"Top-5 accuracy: {top5_accuracy:.4f}")
+
+    if is_dist:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

@@ -211,3 +211,5 @@ data/
 outputs/
 *.pt
 processed_data/
+scripts/hosts.txt
+processed_data_wds/
