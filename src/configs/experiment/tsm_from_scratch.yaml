@@ -1,0 +1,33 @@
+# @package _global_
+# TSM ResNet-50 from scratch — Track A (no pretrained weights).
+# SGD + cosine annealing is the recommended setup for ResNet from scratch.
+defaults:
+  - override /model: tsm
+
+dataset:
+  num_frames: 4    # videos have 4 frames; n_segment must match
+
+training:
+  epochs: 75
+  early_stopping_patience: 10
+  batch_size: 16
+  num_workers: 4
+  device: cuda
+  checkpoint_path: ${hydra:runtime.cwd}/best_model.pt
+
+  # Optimizer
+  optimizer: sgd
+  lr: 0.01
+  momentum: 0.9
+  weight_decay: 0.0001
+  nesterov: true
+
+  # LR schedule: cosine | none
+  lr_scheduler: cosine
+  warmup_epochs: 2
+
+  # Loss
+  label_smoothing: 0.1
+
+  # Mixed precision
+  use_amp: true

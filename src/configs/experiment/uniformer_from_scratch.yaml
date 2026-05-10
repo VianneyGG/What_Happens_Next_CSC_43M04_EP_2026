@@ -1,0 +1,32 @@
+# @package _global_
+# UniFormer-B from scratch — Track A (no pretrained weights).
+# AdamW + cosine LR is the standard setup for transformers.
+defaults:
+  - override /model: uniformer
+
+training:
+  epochs: 50
+  early_stopping_patience: 10
+  batch_size: 4
+  accum_steps: 2   # effective batch = 4 × 2 = 8
+  num_workers: 4
+  device: cuda
+  checkpoint_path: ${hydra:runtime.cwd}/best_model.pt
+
+  # Optimizer
+  optimizer: adamw
+  lr: 0.001
+  weight_decay: 0.05
+
+  # LR schedule
+  lr_scheduler: cosine
+  warmup_epochs: 5
+
+  # Loss
+  label_smoothing: 0.1
+
+  # Mixed precision
+  use_amp: true
+
+  # Gradient clipping (essential for transformers)
+  grad_clip: 1.0
