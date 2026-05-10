@@ -158,6 +158,11 @@ def train_one_epoch(
         labels = labels.to(device)
         is_last = (step == len(data_loader) - 1)
 
+        if torch.isnan(video_batch).any() or torch.isinf(video_batch).any():
+            print(f"  WARNING: NaN/inf in input at step {step}, skipping", flush=True)
+            optimizer.zero_grad()
+            continue
+
         if scaler is not None:
             with torch.amp.autocast("cuda"):
                 logits = model(video_batch)
@@ -168,8 +173,21 @@ def train_one_epoch(
             loss = loss_fn(logits, labels) / accum_steps
             loss.backward()
 
+        loss_val = float(loss.item()) * accum_steps
+        if not math.isfinite(loss_val):
+            print(f"  WARNING: non-finite loss ({loss_val}) at step {step}, skipping update", flush=True)
+            # Must go through the full scaler path so it detects overflow and
+            # backs off its scale factor; bypassing scaler.step() leaves the
+            # scale unchanged and every subsequent batch overflows again.
+            if scaler is not None and (step + 1) % accum_steps == 0 or is_last:
+                scaler.unscale_(optimizer)
+                scaler.step(optimizer)  # will skip due to inf/nan
+                scaler.update()
+            optimizer.zero_grad()
+            continue
+
         # Unscaled loss for logging
-        running_loss += float(loss.item()) * accum_steps * labels.size(0)
+        running_loss += loss_val * labels.size(0)
 
         if (step + 1) % accum_steps == 0 or is_last:
             if scaler is not None:
@@ -186,8 +204,9 @@ def train_one_epoch(
 
         correct += int((logits.argmax(dim=1) == labels).sum().item())
         total += labels.size(0)
-        correct += int((logits.argmax(dim=1) == labels).sum().item())
-        total += labels.size(0)
+
+        if step % 50 == 0:
+            print(f"  step {step}/{len(data_loader)}  loss={loss.item() * accum_steps:.4f}", flush=True)
 
     return running_loss / max(total, 1), correct / max(total, 1)
 

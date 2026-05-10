@@ -2,9 +2,9 @@
 model:
   name: uniformer
   num_classes: ${num_classes}
-  depths: [5, 8, 20, 7]
+  depths: [3, 4, 8, 3]
   dims: [64, 128, 320, 512]
   num_heads: [2, 4, 10, 16]
   mlp_ratio: 4.0
-  drop_path_rate: 0.3
+  drop_path_rate: 0.1
   window_size: [4, 7, 7]

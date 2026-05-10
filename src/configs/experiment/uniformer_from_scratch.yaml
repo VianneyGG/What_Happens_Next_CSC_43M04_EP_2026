@@ -1,21 +1,26 @@
 # @package _global_
-# UniFormer-B from scratch — Track A (no pretrained weights).
+# UniFormer-S from scratch — Track A (no pretrained weights).
 # AdamW + cosine LR is the standard setup for transformers.
 defaults:
   - override /model: uniformer
+
+# 4 frames matches the [4,7,7] window: 1 temporal window in local stages,
+# and halves stage-3 global-attention tokens (392 vs 784 with 8 frames).
+dataset:
+  num_frames: 4
 
 training:
   epochs: 50
   early_stopping_patience: 10
   batch_size: 4
   accum_steps: 2   # effective batch = 4 × 2 = 8
-  num_workers: 4
+  num_workers: 12
   device: cuda
   checkpoint_path: ${hydra:runtime.cwd}/best_model.pt
 
   # Optimizer
   optimizer: adamw
-  lr: 0.001
+  lr: 0.0001
   weight_decay: 0.05
 
   # LR schedule
@@ -25,8 +30,8 @@ training:
   # Loss
   label_smoothing: 0.1
 
-  # Mixed precision
-  use_amp: true
+  # Mixed precision — disabled: fp16 overflows cause persistent NaN with this model size
+  use_amp: false
 
   # Gradient clipping (essential for transformers)
   grad_clip: 1.0
