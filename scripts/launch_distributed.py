@@ -9,36 +9,34 @@ rendezvous master.
 Usage:
     python scripts/launch_distributed.py \\
         --hosts scripts/hosts.txt \\
-        --gpus_per_node 8 \\
-        -- experiment=baseline_from_scratch data=vianney_wds
+        -- experiment=baseline_from_scratch data=vianney_wds_nfs
 
-    # With WebDataset streaming (serves local shards via HTTP reverse tunnel):
+    # Skip code sync (editing directly on the cluster):
     python scripts/launch_distributed.py \\
         --hosts scripts/hosts.txt \\
-        --gpus_per_node 8 \\
-        --wds_dir processed_data_wds \\
-        -- experiment=baseline_from_scratch data=vianney_wds
+        --no_sync \\
+        -- experiment=baseline_from_scratch data=vianney_wds_nfs
 
     # Evaluate distributed:
     python scripts/launch_distributed.py \\
         --hosts scripts/hosts.txt \\
-        --gpus_per_node 8 \\
         --script src/evaluate.py \\
-        -- training.checkpoint_path=src/best_model.pt data=vianney_wds
+        -- training.checkpoint_path=src/best_model.pt data=vianney_wds_nfs
 
 Requires passwordless SSH from the machine running this script to every host
 listed in hosts.txt. The torchrun command runs in --workdir on the remote node.
 
-WebDataset streaming (--wds_dir):
-  Starts a local HTTP server serving the shard directory, then adds an SSH
-  reverse tunnel (-R remote_port:localhost:local_port) to each SSH connection.
-  Each GPU node reads shards from http://localhost:<remote_port>/ which is
-  transparently forwarded back to the local HTTP server. No data copy needed.
+Code sync (default):
+  rsyncs the local repo to master:{workdir}. NFS propagates to all nodes instantly.
+  No git commit/push needed to iterate. Skips .git/, .venv/, checkpoints, and data.
+  Use --no_sync when editing directly on the cluster.
 """
 
 from __future__ import annotations
 
 import argparse
+import dataclasses
+import shlex
 import signal
 import subprocess
 import sys
@@ -49,73 +47,70 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 
-def probe_host(host: str, timeout: int = 5) -> bool:
+# ---------------------------------------------------------------------------
+# Unified host probe
+# ---------------------------------------------------------------------------
+
+@dataclasses.dataclass
+class NodeInfo:
+    host: str
+    gpu_count: int   # 0 = unreachable or no GPU
+    free_mib: int    # min free GPU memory in MiB across all GPUs; 0 on error
+    data_ok: bool    # True if data_dir accessible (or no data_dir specified)
+    skip_reason: str # empty string = include this node
+
+
+def probe_node(host: str, data_dir: str | None, min_free_mib: int, timeout: int = 12) -> NodeInfo:
+    """Single SSH session that collects GPU count, free memory, and data dir in one round-trip."""
+    data_check = f"test -d '{data_dir}' && echo DATA_OK || echo DATA_MISSING" if data_dir else "echo DATA_OK"
+    remote_cmd = (
+        "nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits 2>/dev/null; "
+        "echo '---SEP---'; "
+        + data_check
+    )
     try:
         r = subprocess.run(
             ["ssh", "-o", f"ConnectTimeout={timeout}", "-o", "BatchMode=yes",
-             "-o", "StrictHostKeyChecking=no", host, "exit", "0"],
-            capture_output=True,
-            timeout=timeout + 2,
-        )
-        return r.returncode == 0
-    except subprocess.TimeoutExpired:
-        return False
-
-
-def probe_gpu_count(host: str, timeout: int = 10) -> int:
-    try:
-        r = subprocess.run(
-            ["ssh", "-o", f"ConnectTimeout={timeout}", "-o", "BatchMode=yes",
-             "-o", "StrictHostKeyChecking=no", host,
-             "nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | wc -l"],
+             "-o", "StrictHostKeyChecking=no", host, remote_cmd],
             capture_output=True, text=True, timeout=timeout + 2,
         )
-        if r.returncode == 0:
-            return int(r.stdout.strip())
-    except (subprocess.TimeoutExpired, ValueError):
-        pass
-    return 0
-
-
-def probe_data_dir(host: str, path: str, timeout: int = 10) -> bool:
-    try:
-        r = subprocess.run(
-            ["ssh", "-o", f"ConnectTimeout={timeout}", "-o", "BatchMode=yes",
-             "-o", "StrictHostKeyChecking=no", host, f"test -d {path}"],
-            capture_output=True,
-            timeout=timeout + 2,
-        )
-        return r.returncode == 0
     except subprocess.TimeoutExpired:
-        return False
+        return NodeInfo(host=host, gpu_count=0, free_mib=0, data_ok=False,
+                        skip_reason="SSH timeout")
+
+    if r.returncode != 0:
+        return NodeInfo(host=host, gpu_count=0, free_mib=0, data_ok=False,
+                        skip_reason="SSH unreachable")
+
+    parts = r.stdout.split("---SEP---")
+    gpu_section = parts[0].strip() if parts else ""
+    data_section = parts[1].strip() if len(parts) > 1 else "DATA_MISSING"
+
+    gpu_values = [int(v.strip()) for v in gpu_section.splitlines() if v.strip().isdigit()]
+    gpu_count = len(gpu_values)
+    free_mib = min(gpu_values) if gpu_values else 0
+    data_ok = "DATA_OK" in data_section
+
+    if gpu_count == 0:
+        return NodeInfo(host=host, gpu_count=0, free_mib=0, data_ok=data_ok,
+                        skip_reason="no GPUs detected")
+    if free_mib < min_free_mib:
+        return NodeInfo(host=host, gpu_count=gpu_count, free_mib=free_mib, data_ok=data_ok,
+                        skip_reason=f"only {free_mib} MiB free (< {min_free_mib})")
+    if data_dir and not data_ok:
+        return NodeInfo(host=host, gpu_count=gpu_count, free_mib=free_mib, data_ok=False,
+                        skip_reason=f"data dir not accessible: {data_dir}")
+    return NodeInfo(host=host, gpu_count=gpu_count, free_mib=free_mib, data_ok=data_ok,
+                    skip_reason="")
 
 
-def probe_free_gpu_memory(host: str, timeout: int = 10) -> int:
-    """Return minimum free GPU memory in MiB across all GPUs on host. Returns 0 on error."""
-    try:
-        r = subprocess.run(
-            ["ssh", "-o", f"ConnectTimeout={timeout}", "-o", "BatchMode=yes",
-             "-o", "StrictHostKeyChecking=no", host,
-             "nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits 2>/dev/null"],
-            capture_output=True, text=True, timeout=timeout + 2,
-        )
-        if r.returncode == 0:
-            values = [int(v.strip()) for v in r.stdout.strip().splitlines() if v.strip()]
-            if values:
-                return min(values)
-    except (subprocess.TimeoutExpired, ValueError):
-        pass
-    return 0
-
+# ---------------------------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------------------------
 
 def parse_hosts(hosts_file: str) -> list[str]:
     lines = Path(hosts_file).read_text().splitlines()
     return [line.strip() for line in lines if line.strip() and not line.strip().startswith("#")]
-
-
-def hostname_only(ssh_target: str) -> str:
-    """Strip user@ prefix from an SSH target, leaving just the hostname/IP."""
-    return ssh_target.split("@")[-1]
 
 
 def build_ssh_command(
@@ -137,10 +132,15 @@ def build_ssh_command(
 
 
 def stream_output(proc: subprocess.Popen, prefix: str) -> None:
-    assert proc.stdout is not None
+    if proc.stdout is None:
+        return
     for line in proc.stdout:
         print(f"{prefix} {line}", end="", flush=True)
 
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Multi-node torchrun SSH dispatcher")
@@ -149,7 +149,7 @@ def main() -> None:
         "--min_nodes",
         type=int,
         default=1,
-        help="Minimum live nodes to keep training (elastic mode). Training continues as long as running nodes >= this (default: 1).",
+        help="Minimum live nodes for elastic torchrun; job continues as long as running >= this (default: 1).",
     )
     parser.add_argument(
         "--gpus_per_node",
@@ -196,8 +196,11 @@ def main() -> None:
         default=9888,
         help="Port forwarded on each remote node back to local HTTP server (default: 9888)",
     )
-    parser.add_argument("--no_sync", action="store_true",
-        help="Skip code sync (use when editing directly on NFS or the cluster).")
+    parser.add_argument(
+        "--no_sync",
+        action="store_true",
+        help="Skip code sync (use when editing directly on NFS or the cluster).",
+    )
     parser.add_argument("train_args", nargs=argparse.REMAINDER, help="Hydra overrides passed to the script")
     args = parser.parse_args()
 
@@ -205,79 +208,66 @@ def main() -> None:
     if not hosts:
         sys.exit("No hosts found in hosts file.")
 
-    print("Probing hosts...")
+    # --- Single-pass probe: SSH reachability + GPU count + free memory + data dir ---
+    print(f"Probing {len(hosts)} host(s) (GPU count, free memory >= {args.min_free_gpu_mib} MiB"
+          + (f", data dir {args.data_dir}" if args.data_dir else "") + ") ...")
     with ThreadPoolExecutor(max_workers=len(hosts)) as ex:
-        results = list(ex.map(lambda h: (h, probe_host(h)), hosts))
-    for h, ok in results:
-        if not ok:
-            print(f"  SKIPPED {h} — SSH unreachable", file=sys.stderr)
-    hosts = [h for h, ok in results if ok]
-    if not hosts:
-        sys.exit("No reachable hosts. Abort.")
+        infos: list[NodeInfo] = list(ex.map(
+            lambda h: probe_node(h, args.data_dir, args.min_free_gpu_mib),
+            hosts,
+        ))
 
-    print("Probing GPU counts...")
-    with ThreadPoolExecutor(max_workers=len(hosts)) as ex:
-        gpu_counts = list(ex.map(probe_gpu_count, hosts))
-    for host, n in zip(hosts, gpu_counts):
-        print(f"  {host}: {n} GPU(s)")
-    for host, n in zip(hosts, gpu_counts):
-        if n == 0:
-            print(f"  SKIPPED {host} — no GPUs", file=sys.stderr)
-    hosts = [h for h, n in zip(hosts, gpu_counts) if n > 0]
-    gpu_counts = [n for n in gpu_counts if n > 0]
-    if not hosts:
-        sys.exit("No GPUs found on any alive host. Abort.")
-    effective_gpus = min(gpu_counts)
-    if args.gpus_per_node > effective_gpus:
+    for info in infos:
+        if info.skip_reason:
+            print(f"  SKIP  {info.host} — {info.skip_reason}", file=sys.stderr)
+        else:
+            print(f"  OK    {info.host} — {info.gpu_count} GPU(s), {info.free_mib} MiB free")
+
+    good = [info for info in infos if not info.skip_reason]
+    if not good:
+        sys.exit("No usable nodes after probing. Abort.")
+
+    hosts = [info.host for info in good]
+    nnodes = len(hosts)
+
+    # Clamp gpus_per_node to what's actually available
+    gpus_per_node = args.gpus_per_node
+    effective_gpus = min(info.gpu_count for info in good)
+    if gpus_per_node > effective_gpus:
         print(
-            f"  WARNING: --gpus_per_node={args.gpus_per_node} > available {effective_gpus};"
+            f"  WARNING: --gpus_per_node={gpus_per_node} > available {effective_gpus};"
             f" clamping to {effective_gpus}.",
             file=sys.stderr,
         )
-        args.gpus_per_node = effective_gpus
+        gpus_per_node = effective_gpus
 
-    print(f"Probing free GPU memory (min: {args.min_free_gpu_mib} MiB)...")
-    with ThreadPoolExecutor(max_workers=len(hosts)) as ex:
-        free_mib = list(ex.map(probe_free_gpu_memory, hosts))
-    for host, mib in zip(hosts, free_mib):
-        status = "OK" if mib >= args.min_free_gpu_mib else "LOW"
-        print(f"  {host}: {mib} MiB free [{status}]")
-    for host, mib in zip(hosts, free_mib):
-        if mib < args.min_free_gpu_mib:
-            print(f"  SKIPPED {host} — only {mib} MiB free (< {args.min_free_gpu_mib})", file=sys.stderr)
-    hosts = [h for h, m in zip(hosts, free_mib) if m >= args.min_free_gpu_mib]
-    if not hosts:
-        sys.exit("No nodes with sufficient free GPU memory. Abort.")
-
-    if args.data_dir:
-        print(f"Probing data dir {args.data_dir} ...")
-        with ThreadPoolExecutor(max_workers=len(hosts)) as ex:
-            data_ok = list(ex.map(lambda h: probe_data_dir(h, args.data_dir), hosts))
-        for host, ok in zip(hosts, data_ok):
-            if not ok:
-                print(f"  SKIPPED {host} — data dir not accessible", file=sys.stderr)
-        hosts = [h for h, ok in zip(hosts, data_ok) if ok]
-        if not hosts:
-            sys.exit(f"No hosts can access {args.data_dir}. Abort.")
+    # Validate min_nodes against available node count
+    min_nodes = args.min_nodes
+    if min_nodes > nnodes:
+        print(
+            f"  WARNING: --min_nodes={min_nodes} > usable nodes ({nnodes});"
+            f" clamping to {nnodes}.",
+            file=sys.stderr,
+        )
+        min_nodes = nnodes
 
     # Strip leading '--' separator from remainder args
     train_args = args.train_args[1:] if args.train_args and args.train_args[0] == "--" else args.train_args
 
     master = hosts[0]
-    master_host = hostname_only(master)  # strip user@ for TCP endpoint
-    nnodes = len(hosts)
-    rdzv_id = str(uuid.uuid4())[:8]
+    master_host = master.split("@")[-1]  # strip user@ for TCP endpoint
+    rdzv_id = str(uuid.uuid4())[:16]
 
-    # Sync local working directory to master via rsync — NFS propagates to all nodes instantly.
-    # Use --no_sync if you're editing directly on the cluster (code already on NFS).
+    # --- Code sync: rsync local repo to master (NFS propagates to all nodes) ---
     if not args.no_sync:
         rsync_src = str(Path(__file__).parent.parent.resolve()) + "/"
         rsync_dst = f"{master}:{args.workdir}/"
         print(f"Syncing code to {master}:{args.workdir} ...")
         sync = subprocess.run(
-            ["rsync", "-az", "--delete",
-             "--exclude=.git/", "--exclude=.venv/", "--exclude=__pycache__/",
-             "--exclude=*.pyc", "--exclude=src/outputs/", "--exclude=processed_data_wds/",
+            ["rsync", "-a",
+             "--filter=:- .gitignore",  # respect .gitignore (covers processed_data/, *.pt, etc.)
+             "--exclude=.git/",
+             "--exclude=.venv/",
              rsync_src, rsync_dst],
             capture_output=True, text=True,
         )
@@ -289,14 +279,14 @@ def main() -> None:
         print("Skipping code sync (--no_sync).")
 
     torchrun_cmd = (
-        f"cd {args.workdir} && "
+        f"cd {shlex.quote(args.workdir)} && "
         f"{args.torchrun} "
-        f"--nnodes={args.min_nodes}:{nnodes} "
-        f"--nproc_per_node={args.gpus_per_node} "
+        f"--nnodes={min_nodes}:{nnodes} "
+        f"--nproc_per_node={gpus_per_node} "
         f"--rdzv_backend=c10d "
         f"--rdzv_endpoint={master_host}:{args.port} "
         f"--rdzv_id={rdzv_id} "
-        f"{args.script} {' '.join(train_args)}"
+        f"{args.script} {' '.join(shlex.quote(a) for a in train_args)}"
     )
 
     # --- Optional: local HTTP server + SSH reverse tunnel for WebDataset streaming ---
@@ -314,8 +304,8 @@ def main() -> None:
         print(f"HTTP server started on port {args.http_port} (serving {wds_path})")
         print(f"  → forwarded to remote localhost:{args.remote_http_port} via SSH tunnel")
 
-    print(f"Launching on {nnodes} node(s), {args.gpus_per_node} GPU(s) each ({nnodes * args.gpus_per_node} total)")
-    print(f"Master: {master_host}:{args.port}  rdzv_id: {rdzv_id}")
+    print(f"Launching on {nnodes} node(s), {gpus_per_node} GPU(s) each ({nnodes * gpus_per_node} total)")
+    print(f"Master: {master_host}:{args.port}  rdzv_id: {rdzv_id}  min_nodes: {min_nodes}")
     print(f"Command: {torchrun_cmd}\n")
 
     procs: list[subprocess.Popen] = []
@@ -333,7 +323,6 @@ def main() -> None:
                 http_proc.kill()
             except ProcessLookupError:
                 pass
-        sys.exit(1)
 
     signal.signal(signal.SIGINT, kill_all)
     signal.signal(signal.SIGTERM, kill_all)
@@ -359,16 +348,21 @@ def main() -> None:
 
     def _monitor() -> None:
         while True:
-            still_running = [p for p in procs if p.poll() is None]
-            any_failed = any(p.poll() is not None and p.returncode != 0 for p in procs)
-            if any_failed and len(still_running) < args.min_nodes:
+            snapshots = [(p, p.poll()) for p in procs]
+            running = sum(1 for _, rc in snapshots if rc is None)
+            any_failed = any(rc is not None and rc != 0 for _, rc in snapshots)
+            if any_failed and running < min_nodes:
                 print(
-                    f"\n{len(still_running)} node(s) running < min_nodes={args.min_nodes} — killing all.",
+                    f"\nOnly {running} node(s) alive < min_nodes={min_nodes} — killing all.",
                     file=sys.stderr,
                 )
-                kill_all()
-                return
-            if not still_running:
+                for p, _ in snapshots:
+                    try:
+                        p.kill()
+                    except ProcessLookupError:
+                        pass
+                return  # main thread unblocks from p.wait() and handles sys.exit
+            if running == 0:
                 return
             time.sleep(2)
 
@@ -385,10 +379,10 @@ def main() -> None:
     failed = [(hosts[i], code) for i, code in enumerate(exit_codes) if code != 0]
     succeeded = sum(1 for code in exit_codes if code == 0)
     if failed:
-        if succeeded >= args.min_nodes:
+        if succeeded >= min_nodes:
             print(
-                f"Training completed on {succeeded}/{len(hosts)} node(s) "
-                f"({len(failed)} node(s) dropped but above min_nodes={args.min_nodes})."
+                f"Training completed on {succeeded}/{nnodes} node(s) "
+                f"({len(failed)} node(s) dropped but above min_nodes={min_nodes})."
             )
         else:
             for host, code in failed:
