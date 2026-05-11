@@ -90,6 +90,24 @@ def probe_data_dir(host: str, path: str, timeout: int = 10) -> bool:
         return False
 
 
+def probe_free_gpu_memory(host: str, timeout: int = 10) -> int:
+    """Return minimum free GPU memory in MiB across all GPUs on host. Returns 0 on error."""
+    try:
+        r = subprocess.run(
+            ["ssh", "-o", f"ConnectTimeout={timeout}", "-o", "BatchMode=yes",
+             "-o", "StrictHostKeyChecking=no", host,
+             "nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits 2>/dev/null"],
+            capture_output=True, text=True, timeout=timeout + 2,
+        )
+        if r.returncode == 0:
+            values = [int(v.strip()) for v in r.stdout.strip().splitlines() if v.strip()]
+            if values:
+                return min(values)
+    except (subprocess.TimeoutExpired, ValueError):
+        pass
+    return 0
+
+
 def parse_hosts(hosts_file: str) -> list[str]:
     lines = Path(hosts_file).read_text().splitlines()
     return [line.strip() for line in lines if line.strip() and not line.strip().startswith("#")]
@@ -132,6 +150,12 @@ def main() -> None:
         type=int,
         default=1,
         help="Number of GPUs per node (default: 1 — matches RTX 4000 Ada Generation nodes on this cluster)",
+    )
+    parser.add_argument(
+        "--min_free_gpu_mib",
+        type=int,
+        default=14000,
+        help="Min free GPU memory in MiB to include a node (default: 14000 for 20 GB RTX 4000 Ada).",
     )
     parser.add_argument("--port", type=int, default=29500, help="Rendezvous port on master node")
     parser.add_argument(
@@ -203,6 +227,19 @@ def main() -> None:
             file=sys.stderr,
         )
         args.gpus_per_node = effective_gpus
+
+    print(f"Probing free GPU memory (min: {args.min_free_gpu_mib} MiB)...")
+    with ThreadPoolExecutor(max_workers=len(hosts)) as ex:
+        free_mib = list(ex.map(probe_free_gpu_memory, hosts))
+    for host, mib in zip(hosts, free_mib):
+        status = "OK" if mib >= args.min_free_gpu_mib else "LOW"
+        print(f"  {host}: {mib} MiB free [{status}]")
+    for host, mib in zip(hosts, free_mib):
+        if mib < args.min_free_gpu_mib:
+            print(f"  SKIPPED {host} — only {mib} MiB free (< {args.min_free_gpu_mib})", file=sys.stderr)
+    hosts = [h for h, m in zip(hosts, free_mib) if m >= args.min_free_gpu_mib]
+    if not hosts:
+        sys.exit("No nodes with sufficient free GPU memory. Abort.")
 
     if args.data_dir:
         print(f"Probing data dir {args.data_dir} ...")
