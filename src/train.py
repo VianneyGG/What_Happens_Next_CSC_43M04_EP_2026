@@ -23,6 +23,7 @@ from __future__ import annotations
 import itertools
 import json
 import os
+import sys
 from datetime import datetime, timedelta
 import math
 from pathlib import Path
@@ -159,6 +160,7 @@ def train_one_epoch(
     scaler: Optional[torch.cuda.amp.GradScaler] = None,
     grad_clip: float = 0.0,
     accum_steps: int = 1,
+    total_steps: Optional[int] = None,
 ) -> Tuple[float, float]:
     model.train()
     running_loss = 0.0
@@ -169,10 +171,13 @@ def train_one_epoch(
     for step, (video_batch, labels) in enumerate(data_loader):
         video_batch = video_batch.to(device)
         labels = labels.to(device)
-        try:
-            is_last = (step == len(data_loader) - 1)
-        except TypeError:
-            is_last = False  # IterableDataset (streaming) has no len()
+        if total_steps is not None:
+            is_last = (step + 1 == total_steps)
+        else:
+            try:
+                is_last = (step == len(data_loader) - 1)
+            except TypeError:
+                is_last = False  # IterableDataset (streaming) has no len()
 
         if scaler is not None:
             with torch.amp.autocast("cuda"):
@@ -392,6 +397,14 @@ def main(cfg: DictConfig) -> None:
     epochs_without_improvement = 0
     epoch_step_cap = int(cfg.training.get("steps_per_epoch", 0)) or None
 
+    if cfg.dataset.get("streaming", False) and epoch_step_cap is None:
+        if is_dist:
+            dist.destroy_process_group()
+        sys.exit(
+            "streaming=True requires training.steps_per_epoch > 0 "
+            "(ResampledShards is infinite). Pass training.steps_per_epoch=N."
+        )
+
     for epoch in range(start_epoch, int(cfg.training.epochs)):
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
@@ -399,6 +412,7 @@ def main(cfg: DictConfig) -> None:
         train_loss, train_acc = train_one_epoch(
             model, itertools.islice(train_loader, epoch_step_cap),
             loss_fn, optimizer, device, scaler, grad_clip, accum_steps,
+            total_steps=epoch_step_cap,
         )
 
         if device.type == "cuda":
@@ -445,7 +459,9 @@ def main(cfg: DictConfig) -> None:
                 if cfg.model.name == "cnn_lstm":
                     payload["lstm_hidden_size"] = int(cfg.model.get("lstm_hidden_size", 512))
 
-                torch.save(payload, checkpoint_path)
+                tmp_path = checkpoint_path.with_suffix(".tmp")
+                torch.save(payload, tmp_path)
+                tmp_path.replace(checkpoint_path)
                 print(f"  Saved best model (val acc={val_acc:.4f}) -> {checkpoint_path}")
         else:
             epochs_without_improvement += 1

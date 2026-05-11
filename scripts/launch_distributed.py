@@ -148,6 +148,20 @@ def stream_output(proc: subprocess.Popen, prefix: str) -> None:
         print(f"{prefix} {line}", end="", flush=True)
 
 
+def check_rdzv_reachable(host: str, rdzv_host: str, rdzv_port: int, timeout: int = 5) -> bool:
+    """Return True if host can make a TCP connection to rdzv_host:rdzv_port."""
+    try:
+        r = subprocess.run(
+            ["ssh", "-o", "BatchMode=yes", "-o", f"ConnectTimeout={timeout}",
+             "-o", "StrictHostKeyChecking=no",
+             host, f"nc -z -w{timeout} {rdzv_host} {rdzv_port} && echo OK || echo FAIL"],
+            capture_output=True, text=True, timeout=timeout + 2,
+        )
+    except subprocess.TimeoutExpired:
+        return False
+    return "OK" in r.stdout
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -296,6 +310,51 @@ def main() -> None:
     else:
         print("Skipping code sync (--no_sync).")
 
+    # --- Optional: TCPStore coordinator for external rdzv_host ---
+    # When --rdzv_host points to a host not in the compute list (e.g. login node),
+    # nothing will listen on rdzv_host:port unless we start a store there explicitly.
+    rdzv_coord_proc: subprocess.Popen | None = None
+    if args.rdzv_host:
+        good_hostnames = {info.host.split("@")[-1] for info in good}
+        if args.rdzv_host not in good_hostnames:
+            coord_py = (
+                f"import torch.distributed as dist, signal; "
+                f"dist.TCPStore('{args.rdzv_host}', {args.port}, -1, True); "
+                f"signal.pause()"
+            )
+            rdzv_coord_proc = subprocess.Popen(
+                ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes",
+                 args.rdzv_host, f"python3 -c {shlex.quote(coord_py)}"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            time.sleep(1.5)
+            if rdzv_coord_proc.poll() is not None:
+                sys.exit(f"Failed to start TCPStore coordinator on {args.rdzv_host}:{args.port}")
+            print(f"  rdzv coordinator on {args.rdzv_host}:{args.port}")
+            # Filter out nodes that are firewall-blocked from reaching the coordinator
+            with ThreadPoolExecutor(max_workers=len(good)) as ex:
+                reachable = list(ex.map(
+                    lambda info: check_rdzv_reachable(info.host, args.rdzv_host, args.port),
+                    good,
+                ))
+            for info, ok in zip(good, reachable):
+                if not ok:
+                    print(f"  SKIP  {info.host} — can't reach rdzv {args.rdzv_host}:{args.port}", file=sys.stderr)
+            prev_count = len(good)
+            good = [info for info, ok in zip(good, reachable) if ok]
+            dropped = prev_count - len(good)
+            filter_note = f"  ({dropped} unreachable)" if dropped else ""
+            print(f"  {len(good)}/{prev_count} nodes reach rdzv{filter_note}")
+            if not good:
+                rdzv_coord_proc.kill()
+                sys.exit(f"No nodes can reach rdzv host {args.rdzv_host}:{args.port}. Abort.")
+            hosts = [info.host for info in good]
+            nnodes = len(hosts)
+            if min_nodes > nnodes:
+                min_nodes = nnodes
+            master = hosts[0]
+            master_host = master.split("@")[-1]
+
     torchrun_cmd = (
         f"cd {shlex.quote(args.workdir)} && "
         f"TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=90 "
@@ -338,6 +397,11 @@ def main() -> None:
         if http_proc is not None:
             try:
                 http_proc.kill()
+            except ProcessLookupError:
+                pass
+        if rdzv_coord_proc is not None:
+            try:
+                rdzv_coord_proc.kill()
             except ProcessLookupError:
                 pass
 
@@ -393,6 +457,10 @@ def main() -> None:
     if http_proc is not None:
         http_proc.kill()
         print("HTTP server stopped.")
+
+    if rdzv_coord_proc is not None:
+        rdzv_coord_proc.kill()
+        print("rdzv coordinator stopped.")
 
     failed = [(hosts[i], code) for i, code in enumerate(exit_codes) if code != 0]
     succeeded = sum(1 for code in exit_codes if code == 0)
