@@ -1,0 +1,22 @@
+# @package _global_
+# WebDataset streaming from NFS home directory (no HTTP server required).
+# All compute nodes share the NFS home, so shards written there are readable everywhere.
+#
+# Conversion (run once on a machine with /Data/ access, e.g. the login node):
+#   cd /users/eleves-b/2024/vianney.gauthier/Cours/ModalDL/What_Happens_Next_CSC_43M04_EP_2026
+#   uv run python src/misc/convert_to_webdataset.py \
+#     --input_dir /Data/vianney.gauthier/processed_data \
+#     --output_dir processed_data_wds
+#
+# Launch (glob picks up all shards automatically):
+#   uv run scripts/launch_distributed.py --hosts scripts/hosts_reachable.txt \
+#     -- experiment=baseline_from_scratch data=vianney_wds_nfs
+
+dataset:
+  train_shards: "/users/eleves-b/2024/vianney.gauthier/Cours/ModalDL/What_Happens_Next_CSC_43M04_EP_2026/processed_data_wds/train/*.tar"
+  val_shards: "/users/eleves-b/2024/vianney.gauthier/Cours/ModalDL/What_Happens_Next_CSC_43M04_EP_2026/processed_data_wds/val/*.tar"
+  num_frames: 4
+  val_ratio: 0.2
+  seed: 42
+  max_samples: null
+  streaming: true

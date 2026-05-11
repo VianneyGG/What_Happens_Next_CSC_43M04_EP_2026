@@ -62,6 +62,34 @@ def probe_host(host: str, timeout: int = 5) -> bool:
         return False
 
 
+def probe_gpu_count(host: str, timeout: int = 10) -> int:
+    try:
+        r = subprocess.run(
+            ["ssh", "-o", f"ConnectTimeout={timeout}", "-o", "BatchMode=yes",
+             "-o", "StrictHostKeyChecking=no", host,
+             "nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | wc -l"],
+            capture_output=True, text=True, timeout=timeout + 2,
+        )
+        if r.returncode == 0:
+            return int(r.stdout.strip())
+    except (subprocess.TimeoutExpired, ValueError):
+        pass
+    return 0
+
+
+def probe_data_dir(host: str, path: str, timeout: int = 10) -> bool:
+    try:
+        r = subprocess.run(
+            ["ssh", "-o", f"ConnectTimeout={timeout}", "-o", "BatchMode=yes",
+             "-o", "StrictHostKeyChecking=no", host, f"test -d {path}"],
+            capture_output=True,
+            timeout=timeout + 2,
+        )
+        return r.returncode == 0
+    except subprocess.TimeoutExpired:
+        return False
+
+
 def parse_hosts(hosts_file: str) -> list[str]:
     lines = Path(hosts_file).read_text().splitlines()
     return [line.strip() for line in lines if line.strip() and not line.strip().startswith("#")]
@@ -99,7 +127,12 @@ def stream_output(proc: subprocess.Popen, prefix: str) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Multi-node torchrun SSH dispatcher")
     parser.add_argument("--hosts", required=True, help="Path to hosts file (one hostname/IP per line)")
-    parser.add_argument("--gpus_per_node", type=int, required=True, help="Number of GPUs per node")
+    parser.add_argument(
+        "--gpus_per_node",
+        type=int,
+        default=1,
+        help="Number of GPUs per node (default: 1 — matches RTX 4000 Ada Generation nodes on this cluster)",
+    )
     parser.add_argument("--port", type=int, default=29500, help="Rendezvous port on master node")
     parser.add_argument(
         "--workdir",
@@ -115,6 +148,11 @@ def main() -> None:
         "--script",
         default="src/train.py",
         help="Python script to run relative to --workdir (default: src/train.py)",
+    )
+    parser.add_argument(
+        "--data_dir",
+        default=None,
+        help="Remote data directory to probe on each host; nodes that cannot access it are skipped.",
     )
     parser.add_argument(
         "--wds_dir",
@@ -145,6 +183,38 @@ def main() -> None:
     if not hosts:
         sys.exit("No reachable hosts. Abort.")
 
+    print("Probing GPU counts...")
+    with ThreadPoolExecutor(max_workers=len(hosts)) as ex:
+        gpu_counts = list(ex.map(probe_gpu_count, hosts))
+    for host, n in zip(hosts, gpu_counts):
+        print(f"  {host}: {n} GPU(s)")
+    for host, n in zip(hosts, gpu_counts):
+        if n == 0:
+            print(f"  SKIPPED {host} — no GPUs", file=sys.stderr)
+    hosts = [h for h, n in zip(hosts, gpu_counts) if n > 0]
+    gpu_counts = [n for n in gpu_counts if n > 0]
+    if not hosts:
+        sys.exit("No GPUs found on any alive host. Abort.")
+    effective_gpus = min(gpu_counts)
+    if args.gpus_per_node > effective_gpus:
+        print(
+            f"  WARNING: --gpus_per_node={args.gpus_per_node} > available {effective_gpus};"
+            f" clamping to {effective_gpus}.",
+            file=sys.stderr,
+        )
+        args.gpus_per_node = effective_gpus
+
+    if args.data_dir:
+        print(f"Probing data dir {args.data_dir} ...")
+        with ThreadPoolExecutor(max_workers=len(hosts)) as ex:
+            data_ok = list(ex.map(lambda h: probe_data_dir(h, args.data_dir), hosts))
+        for host, ok in zip(hosts, data_ok):
+            if not ok:
+                print(f"  SKIPPED {host} — data dir not accessible", file=sys.stderr)
+        hosts = [h for h, ok in zip(hosts, data_ok) if ok]
+        if not hosts:
+            sys.exit(f"No hosts can access {args.data_dir}. Abort.")
+
     # Strip leading '--' separator from remainder args
     train_args = args.train_args[1:] if args.train_args and args.train_args[0] == "--" else args.train_args
 
@@ -153,9 +223,20 @@ def main() -> None:
     nnodes = len(hosts)
     rdzv_id = str(uuid.uuid4())[:8]
 
+    # Sync code once on master — NFS propagates to all nodes; avoids .git/index.lock races
+    print(f"Syncing code on {master}...")
+    sync = subprocess.run(
+        ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes",
+         master, f"cd {args.workdir} && git fetch origin && git reset --hard origin/HEAD"],
+        capture_output=True, text=True,
+    )
+    if sync.returncode != 0:
+        print(f"  WARNING: git sync failed — {sync.stderr.strip()}", file=sys.stderr)
+    else:
+        print(f"  {sync.stdout.strip() or 'Already up to date.'}")
+
     torchrun_cmd = (
         f"cd {args.workdir} && "
-        f"git pull --ff-only && "
         f"{args.torchrun} "
         f"--nnodes={nnodes} "
         f"--nproc_per_node={args.gpus_per_node} "

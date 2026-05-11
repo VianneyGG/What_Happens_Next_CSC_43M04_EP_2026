@@ -14,6 +14,7 @@ disjoint subset within the node's shards.
 
 from __future__ import annotations
 
+import glob as _glob
 import io
 from typing import Callable
 
@@ -22,6 +23,17 @@ import torch
 import webdataset as wds
 from PIL import Image
 from torch.utils.data import DataLoader
+
+
+def _resolve_shards(pattern: str | list[str]) -> str | list[str]:
+    if isinstance(pattern, list):
+        return pattern
+    if pattern.startswith("http"):
+        return pattern
+    paths = sorted(_glob.glob(pattern))
+    if not paths:
+        raise FileNotFoundError(f"No shards found: {pattern}")
+    return paths
 
 
 def make_streaming_loader(
@@ -51,7 +63,7 @@ def make_streaming_loader(
     """
     def decode_sample(sample: dict) -> tuple[torch.Tensor, torch.Tensor]:
         npz = np.load(io.BytesIO(sample["frames.npz"]))
-        label = int(sample["cls"])
+        label = int(sample["cls"].decode().strip())
         frames = []
         for i in range(num_frames):
             key = f"frame_{i}"
@@ -65,7 +77,7 @@ def make_streaming_loader(
         return video, label_tensor
 
     pipeline_steps: list = [
-        wds.SimpleShardList(shard_pattern),
+        wds.SimpleShardList(_resolve_shards(shard_pattern)),
     ]
     if is_train:
         pipeline_steps.append(wds.shuffle(100))  # shuffle shard order
