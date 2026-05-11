@@ -20,9 +20,10 @@ Multi-node distributed training (torchrun):
 
 from __future__ import annotations
 
+import itertools
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 import math
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
@@ -249,10 +250,18 @@ def main(cfg: DictConfig) -> None:
     is_dist = world_size > 1
 
     if is_dist:
-        dist.init_process_group(backend=cfg.training.get("dist_backend", "nccl"))
+        dist.init_process_group(
+            backend=cfg.training.get("dist_backend", "nccl"),
+            timeout=timedelta(seconds=int(cfg.training.get("nccl_timeout_sec", 120))),
+        )
 
     if rank == 0:
-        print(OmegaConf.to_yaml(cfg))
+        print(
+            f"model={cfg.model.name}  bs={cfg.training.batch_size}  "
+            f"lr={cfg.training.lr}  epochs={cfg.training.epochs}  "
+            f"workers={cfg.training.num_workers}  amp={cfg.training.get('use_amp', False)}  "
+            f"ws={world_size}"
+        )
 
     # Different seed per rank ensures independent data augmentation
     set_seed(int(cfg.dataset.seed) + rank)
@@ -381,14 +390,20 @@ def main(cfg: DictConfig) -> None:
     # --- Training loop ---
     patience = int(cfg.training.get("early_stopping_patience", 0))
     epochs_without_improvement = 0
+    epoch_step_cap = int(cfg.training.get("steps_per_epoch", 0)) or None
 
     for epoch in range(start_epoch, int(cfg.training.epochs)):
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
 
         train_loss, train_acc = train_one_epoch(
-            model, train_loader, loss_fn, optimizer, device, scaler, grad_clip, accum_steps
+            model, itertools.islice(train_loader, epoch_step_cap),
+            loss_fn, optimizer, device, scaler, grad_clip, accum_steps,
         )
+
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
         val_loss, val_acc = evaluate_epoch(model, val_loader, loss_fn, device, scaler)
 
         # Average metrics across all ranks for consistent logging and checkpoint decisions

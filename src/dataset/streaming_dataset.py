@@ -76,25 +76,28 @@ def make_streaming_loader(
         label_tensor = torch.tensor(label, dtype=torch.long)
         return video, label_tensor
 
-    pipeline_steps: list = [
-        wds.SimpleShardList(_resolve_shards(shard_pattern)),
-    ]
     if is_train:
-        pipeline_steps.append(wds.shuffle(100))  # shuffle shard order
-
-    pipeline_steps += [
-        wds.split_by_node,    # distribute shards across DDP nodes (uses RANK / WORLD_SIZE)
-        wds.split_by_worker,  # distribute shards across DataLoader workers
-        wds.tarfile_to_samples(),
-    ]
-
-    if is_train:
-        pipeline_steps.append(wds.shuffle(1000))  # shuffle sample order within buffer
-
-    pipeline_steps += [
-        wds.map(decode_sample),
-        wds.batched(batch_size, collation_fn=torch.utils.data.default_collate, partial=False),
-    ]
+        # ResampledShards resamples shards with replacement → infinite iterator.
+        # Combined with islice(train_loader, steps_per_epoch) in train.py, all DDP
+        # ranks run exactly steps_per_epoch backward passes regardless of shard count.
+        pipeline_steps: list = [
+            wds.ResampledShards(_resolve_shards(shard_pattern)),
+            wds.split_by_node,
+            wds.split_by_worker,
+            wds.tarfile_to_samples(),
+            wds.shuffle(1000),
+            wds.map(decode_sample),
+            wds.batched(batch_size, collation_fn=torch.utils.data.default_collate, partial=False),
+        ]
+    else:
+        pipeline_steps = [
+            wds.SimpleShardList(_resolve_shards(shard_pattern)),
+            wds.split_by_node,
+            wds.split_by_worker,
+            wds.tarfile_to_samples(),
+            wds.map(decode_sample),
+            wds.batched(batch_size, collation_fn=torch.utils.data.default_collate, partial=False),
+        ]
 
     dataset = wds.DataPipeline(*pipeline_steps)
 

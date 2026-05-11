@@ -3,28 +3,38 @@
 Multi-node torchrun launcher via SSH.
 
 Reads a hosts file, SSHes into each node in parallel, and launches torchrun
-with the c10d rendezvous backend. The first host in the file becomes the
-rendezvous master.
+with the c10d rendezvous backend. By default the first host in the file is the
+rendezvous endpoint; use --rdzv_host to point it at a stable login node instead.
 
 Usage:
+    # Standard launch from local machine (bugatti = login node = stable rdzv host):
     python scripts/launch_distributed.py \\
         --hosts scripts/hosts.txt \\
+        --rdzv_host bugatti.polytechnique.fr \\
         -- experiment=baseline_from_scratch data=vianney_wds_nfs
 
     # Skip code sync (editing directly on the cluster):
     python scripts/launch_distributed.py \\
         --hosts scripts/hosts.txt \\
+        --rdzv_host bugatti.polytechnique.fr \\
         --no_sync \\
         -- experiment=baseline_from_scratch data=vianney_wds_nfs
 
     # Evaluate distributed:
     python scripts/launch_distributed.py \\
         --hosts scripts/hosts.txt \\
+        --rdzv_host bugatti.polytechnique.fr \\
         --script src/evaluate.py \\
         -- training.checkpoint_path=src/best_model.pt data=vianney_wds_nfs
 
 Requires passwordless SSH from the machine running this script to every host
 listed in hosts.txt. The torchrun command runs in --workdir on the remote node.
+
+Rendezvous host (--rdzv_host):
+  c10d TCPStore runs on this host; all compute nodes connect to it on --port.
+  Default: hosts[0] (first compute node — a SPOF if that node is preempted).
+  Recommended: set to bugatti.polytechnique.fr (login node, always up).
+  Requires port 29500 open on that host from compute nodes.
 
 Code sync (default):
   rsyncs the local repo to master:{workdir}. NFS propagates to all nodes instantly.
@@ -165,6 +175,12 @@ def main() -> None:
     )
     parser.add_argument("--port", type=int, default=29500, help="Rendezvous port on master node")
     parser.add_argument(
+        "--rdzv_host",
+        default=None,
+        help="Hostname/IP for the c10d rendezvous endpoint (default: first host in hosts file). "
+             "Set to the login node hostname when running from tmux there: --rdzv_host $(hostname)",
+    )
+    parser.add_argument(
         "--workdir",
         default="/users/eleves-b/2024/vianney.gauthier/Cours/ModalDL/What_Happens_Next_CSC_43M04_EP_2026",
         help="Remote repo root (absolute path on the remote nodes).",
@@ -220,10 +236,11 @@ def main() -> None:
     for info in infos:
         if info.skip_reason:
             print(f"  SKIP  {info.host} — {info.skip_reason}", file=sys.stderr)
-        else:
-            print(f"  OK    {info.host} — {info.gpu_count} GPU(s), {info.free_mib} MiB free")
 
     good = [info for info in infos if not info.skip_reason]
+    skipped = len(infos) - len(good)
+    skip_note = f"  ({skipped} skipped)" if skipped else ""
+    print(f"  {len(good)}/{len(infos)} nodes ready{skip_note}")
     if not good:
         sys.exit("No usable nodes after probing. Abort.")
 
@@ -255,7 +272,8 @@ def main() -> None:
     train_args = args.train_args[1:] if args.train_args and args.train_args[0] == "--" else args.train_args
 
     master = hosts[0]
-    master_host = master.split("@")[-1]  # strip user@ for TCP endpoint
+    master_host = master.split("@")[-1]  # strip user@ — SSH target only
+    rdzv_host = args.rdzv_host if args.rdzv_host else master_host
     rdzv_id = str(uuid.uuid4())[:16]
 
     # --- Code sync: rsync local repo to master (NFS propagates to all nodes) ---
@@ -280,11 +298,12 @@ def main() -> None:
 
     torchrun_cmd = (
         f"cd {shlex.quote(args.workdir)} && "
+        f"TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=90 "
         f"{args.torchrun} "
         f"--nnodes={min_nodes}:{nnodes} "
         f"--nproc_per_node={gpus_per_node} "
         f"--rdzv_backend=c10d "
-        f"--rdzv_endpoint={master_host}:{args.port} "
+        f"--rdzv_endpoint={rdzv_host}:{args.port} "
         f"--rdzv_id={rdzv_id} "
         f"{args.script} {' '.join(shlex.quote(a) for a in train_args)}"
     )
@@ -304,9 +323,7 @@ def main() -> None:
         print(f"HTTP server started on port {args.http_port} (serving {wds_path})")
         print(f"  → forwarded to remote localhost:{args.remote_http_port} via SSH tunnel")
 
-    print(f"Launching on {nnodes} node(s), {gpus_per_node} GPU(s) each ({nnodes * gpus_per_node} total)")
-    print(f"Master: {master_host}:{args.port}  rdzv_id: {rdzv_id}  min_nodes: {min_nodes}")
-    print(f"Command: {torchrun_cmd}\n")
+    print(f"Launching {nnodes}×{gpus_per_node} GPU  rdzv={rdzv_host}:{args.port}  id={rdzv_id[:8]}  min={min_nodes}")
 
     procs: list[subprocess.Popen] = []
     threads: list[threading.Thread] = []
@@ -328,7 +345,8 @@ def main() -> None:
     signal.signal(signal.SIGTERM, kill_all)
 
     for i, host in enumerate(hosts):
-        prefix = f"[node{i}|{host}]"
+        short = host.split("@")[-1].split(".")[0]
+        prefix = f"[{i}|{short}]"
         ssh_cmd = build_ssh_command(
             host=host,
             remote_cmd=torchrun_cmd,
