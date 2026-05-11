@@ -146,6 +146,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Multi-node torchrun SSH dispatcher")
     parser.add_argument("--hosts", required=True, help="Path to hosts file (one hostname/IP per line)")
     parser.add_argument(
+        "--min_nodes",
+        type=int,
+        default=1,
+        help="Minimum live nodes to keep training (elastic mode). Training continues as long as running nodes >= this (default: 1).",
+    )
+    parser.add_argument(
         "--gpus_per_node",
         type=int,
         default=1,
@@ -190,6 +196,8 @@ def main() -> None:
         default=9888,
         help="Port forwarded on each remote node back to local HTTP server (default: 9888)",
     )
+    parser.add_argument("--no_sync", action="store_true",
+        help="Skip code sync (use when editing directly on NFS or the cluster).")
     parser.add_argument("train_args", nargs=argparse.REMAINDER, help="Hydra overrides passed to the script")
     args = parser.parse_args()
 
@@ -260,22 +268,30 @@ def main() -> None:
     nnodes = len(hosts)
     rdzv_id = str(uuid.uuid4())[:8]
 
-    # Sync code once on master — NFS propagates to all nodes; avoids .git/index.lock races
-    print(f"Syncing code on {master}...")
-    sync = subprocess.run(
-        ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes",
-         master, f"cd {args.workdir} && git fetch origin && git reset --hard origin/HEAD"],
-        capture_output=True, text=True,
-    )
-    if sync.returncode != 0:
-        print(f"  WARNING: git sync failed — {sync.stderr.strip()}", file=sys.stderr)
+    # Sync local working directory to master via rsync — NFS propagates to all nodes instantly.
+    # Use --no_sync if you're editing directly on the cluster (code already on NFS).
+    if not args.no_sync:
+        rsync_src = str(Path(__file__).parent.parent.resolve()) + "/"
+        rsync_dst = f"{master}:{args.workdir}/"
+        print(f"Syncing code to {master}:{args.workdir} ...")
+        sync = subprocess.run(
+            ["rsync", "-az", "--delete",
+             "--exclude=.git/", "--exclude=.venv/", "--exclude=__pycache__/",
+             "--exclude=*.pyc", "--exclude=src/outputs/", "--exclude=processed_data_wds/",
+             rsync_src, rsync_dst],
+            capture_output=True, text=True,
+        )
+        if sync.returncode != 0:
+            print(f"  WARNING: rsync failed — {sync.stderr.strip()}", file=sys.stderr)
+        else:
+            print("  Code synced.")
     else:
-        print(f"  {sync.stdout.strip() or 'Already up to date.'}")
+        print("Skipping code sync (--no_sync).")
 
     torchrun_cmd = (
         f"cd {args.workdir} && "
         f"{args.torchrun} "
-        f"--nnodes={nnodes} "
+        f"--nnodes={args.min_nodes}:{nnodes} "
         f"--nproc_per_node={args.gpus_per_node} "
         f"--rdzv_backend=c10d "
         f"--rdzv_endpoint={master_host}:{args.port} "
@@ -343,11 +359,17 @@ def main() -> None:
 
     def _monitor() -> None:
         while True:
-            for p in procs:
-                if p.poll() is not None and p.returncode != 0:
-                    print(f"\nNode exited with code {p.returncode} — killing all.", file=sys.stderr)
-                    kill_all()
-                    return
+            still_running = [p for p in procs if p.poll() is None]
+            any_failed = any(p.poll() is not None and p.returncode != 0 for p in procs)
+            if any_failed and len(still_running) < args.min_nodes:
+                print(
+                    f"\n{len(still_running)} node(s) running < min_nodes={args.min_nodes} — killing all.",
+                    file=sys.stderr,
+                )
+                kill_all()
+                return
+            if not still_running:
+                return
             time.sleep(2)
 
     threading.Thread(target=_monitor, daemon=True).start()
@@ -361,12 +383,19 @@ def main() -> None:
         print("HTTP server stopped.")
 
     failed = [(hosts[i], code) for i, code in enumerate(exit_codes) if code != 0]
+    succeeded = sum(1 for code in exit_codes if code == 0)
     if failed:
-        for host, code in failed:
-            print(f"FAILED [{host}] exit code {code}", file=sys.stderr)
-        sys.exit(1)
-
-    print("All nodes completed successfully.")
+        if succeeded >= args.min_nodes:
+            print(
+                f"Training completed on {succeeded}/{len(hosts)} node(s) "
+                f"({len(failed)} node(s) dropped but above min_nodes={args.min_nodes})."
+            )
+        else:
+            for host, code in failed:
+                print(f"FAILED [{host}] exit code {code}", file=sys.stderr)
+            sys.exit(1)
+    else:
+        print("All nodes completed successfully.")
 
 
 if __name__ == "__main__":

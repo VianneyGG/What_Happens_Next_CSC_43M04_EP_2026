@@ -363,13 +363,26 @@ def main(cfg: DictConfig) -> None:
     grad_clip = float(cfg.training.get("grad_clip", 0.0))
     accum_steps = int(cfg.training.get("accum_steps", 1))
 
-    # --- Training loop ---
+    # --- Auto-resume (elastic restarts re-run the script; pick up from last checkpoint) ---
     best_val_accuracy = 0.0
+    start_epoch = 0
     checkpoint_path = Path(cfg.training.checkpoint_path).resolve()
+    if checkpoint_path.exists():
+        ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+        raw_model = model.module if is_dist else model
+        raw_model.load_state_dict(ckpt["model_state_dict"])
+        if "optimizer_state_dict" in ckpt:
+            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        start_epoch = ckpt.get("epoch", 0) + 1
+        best_val_accuracy = float(ckpt.get("best_val_accuracy", ckpt.get("val_accuracy", 0.0)))
+        if rank == 0:
+            print(f"Resumed from checkpoint (epoch {start_epoch}, best_val_acc={best_val_accuracy:.4f})")
+
+    # --- Training loop ---
     patience = int(cfg.training.get("early_stopping_patience", 0))
     epochs_without_improvement = 0
 
-    for epoch in range(int(cfg.training.epochs)):
+    for epoch in range(start_epoch, int(cfg.training.epochs)):
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
 
@@ -402,6 +415,9 @@ def main(cfg: DictConfig) -> None:
                 raw_model = model.module if is_dist else model
                 payload: Dict[str, Any] = {
                     "model_state_dict": raw_model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "epoch": epoch,
+                    "best_val_accuracy": val_acc,
                     "model_name": cfg.model.name,
                     "num_classes": int(cfg.model.num_classes),
                     "num_frames": num_frames,
