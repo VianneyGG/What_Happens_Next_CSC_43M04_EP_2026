@@ -322,9 +322,11 @@ def main() -> None:
                 f"dist.TCPStore('{args.rdzv_host}', {args.port}, -1, True); "
                 f"signal.pause()"
             )
+            venv_python = str(Path(args.torchrun).parent / "python")
+            coord_cmd = f"cd {shlex.quote(args.workdir)} && {venv_python} -c {shlex.quote(coord_py)}"
             rdzv_coord_proc = subprocess.Popen(
                 ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes",
-                 args.rdzv_host, f"python3 -c {shlex.quote(coord_py)}"],
+                 args.rdzv_host, coord_cmd],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             )
             time.sleep(1.5)
