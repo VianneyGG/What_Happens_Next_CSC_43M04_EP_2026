@@ -231,6 +231,13 @@ def main() -> None:
         action="store_true",
         help="Skip code sync (use when editing directly on NFS or the cluster).",
     )
+    # --- Training hyperparameters (RTX 4000 Ada defaults) ---
+    parser.add_argument("--num_workers", type=int, default=2,
+        help="DataLoader workers per GPU (default: 2, tuned for RTX 4000 Ada nodes)")
+    parser.add_argument("--epochs", type=int, default=20,
+        help="Training epochs (default: 20)")
+    parser.add_argument("--model", type=str, default="cnn_baseline",
+        help="Model name — passed as Hydra override model=<name> (default: cnn_baseline)")
     parser.add_argument("train_args", nargs=argparse.REMAINDER, help="Hydra overrides passed to the script")
     args = parser.parse_args()
 
@@ -285,6 +292,14 @@ def main() -> None:
     # Strip leading '--' separator from remainder args
     train_args = args.train_args[1:] if args.train_args and args.train_args[0] == "--" else args.train_args
 
+    # Prepend hyperparameter defaults as Hydra overrides; explicit train_args take precedence
+    injected = [
+        f"training.num_workers={args.num_workers}",
+        f"training.epochs={args.epochs}",
+        f"model={args.model}",
+    ]
+    train_args = injected + train_args
+
     master = hosts[0]
     master_host = master.split("@")[-1]  # strip user@ — SSH target only
     rdzv_host = args.rdzv_host if args.rdzv_host else master_host
@@ -317,6 +332,9 @@ def main() -> None:
     if args.rdzv_host:
         good_hostnames = {info.host.split("@")[-1] for info in good}
         if args.rdzv_host not in good_hostnames:
+            # Derive ssh user from hosts list (entries are user@host); fall back to bare hostname.
+            cluster_user = hosts[0].split("@")[0] if "@" in hosts[0] else None
+            rdzv_ssh_target = f"{cluster_user}@{args.rdzv_host}" if cluster_user else args.rdzv_host
             coord_py = (
                 f"import torch.distributed as dist, signal; "
                 f"dist.TCPStore('{args.rdzv_host}', {args.port}, -1, True); "
@@ -326,12 +344,18 @@ def main() -> None:
             coord_cmd = f"cd {shlex.quote(args.workdir)} && {venv_python} -c {shlex.quote(coord_py)}"
             rdzv_coord_proc = subprocess.Popen(
                 ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes",
-                 args.rdzv_host, coord_cmd],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                 rdzv_ssh_target, coord_cmd],
+                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
             )
-            time.sleep(1.5)
+            time.sleep(3.0)
             if rdzv_coord_proc.poll() is not None:
-                sys.exit(f"Failed to start TCPStore coordinator on {args.rdzv_host}:{args.port}")
+                err = rdzv_coord_proc.stderr.read().decode().strip()
+                sys.exit(
+                    f"Failed to start TCPStore coordinator on {args.rdzv_host}:{args.port}\n"
+                    f"  ssh target: {rdzv_ssh_target}\n"
+                    f"  stderr: {err or '(empty)'}\n"
+                    f"  coord_cmd: {coord_cmd}"
+                )
             print(f"  rdzv coordinator on {args.rdzv_host}:{args.port}")
             # Filter out nodes that are firewall-blocked from reaching the coordinator
             with ThreadPoolExecutor(max_workers=len(good)) as ex:
@@ -343,23 +367,35 @@ def main() -> None:
                 if not ok:
                     print(f"  SKIP  {info.host} — can't reach rdzv {args.rdzv_host}:{args.port}", file=sys.stderr)
             prev_count = len(good)
-            good = [info for info, ok in zip(good, reachable) if ok]
-            dropped = prev_count - len(good)
+            reachable_good = [info for info, ok in zip(good, reachable) if ok]
+            dropped = prev_count - len(reachable_good)
             filter_note = f"  ({dropped} unreachable)" if dropped else ""
-            print(f"  {len(good)}/{prev_count} nodes reach rdzv{filter_note}")
-            if not good:
+            print(f"  {len(reachable_good)}/{prev_count} nodes reach rdzv{filter_note}")
+            if not reachable_good:
+                # Bugatti is firewalled from all compute nodes — kill external coordinator
+                # and fall back to using the first compute node as rdzv_host instead.
                 rdzv_coord_proc.kill()
-                sys.exit(f"No nodes can reach rdzv host {args.rdzv_host}:{args.port}. Abort.")
-            hosts = [info.host for info in good]
-            nnodes = len(hosts)
-            if min_nodes > nnodes:
-                min_nodes = nnodes
-            master = hosts[0]
-            master_host = master.split("@")[-1]
+                rdzv_coord_proc = None
+                fallback = good[0].host.split("@")[-1]
+                print(
+                    f"  WARNING: {args.rdzv_host}:{args.port} unreachable from all nodes "
+                    f"(firewall). Falling back to compute node {fallback} as rdzv_host.",
+                    file=sys.stderr,
+                )
+                rdzv_host = fallback
+                # All good nodes are usable — no reachability filter needed.
+            else:
+                good = reachable_good
+                hosts = [info.host for info in good]
+                nnodes = len(hosts)
+                if min_nodes > nnodes:
+                    min_nodes = nnodes
+                master = hosts[0]
+                master_host = master.split("@")[-1]
 
     torchrun_cmd = (
         f"cd {shlex.quote(args.workdir)} && "
-        f"TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=90 "
+        f"TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=600 "
         f"{args.torchrun} "
         f"--nnodes={min_nodes}:{nnodes} "
         f"--nproc_per_node={gpus_per_node} "

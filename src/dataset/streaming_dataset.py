@@ -7,9 +7,15 @@ Shards can be local paths or HTTP URLs (served via the launcher's reverse tunnel
 Tensor contract: same as VideoFrameDataset — returns (B, T, C, H, W) video tensors
 and (B,) int64 label tensors.
 
-In distributed training, split_by_node + split_by_worker replace DistributedSampler:
-each GPU node reads a disjoint subset of shards, and each DataLoader worker reads a
-disjoint subset within the node's shards.
+Distributed behaviour:
+  Train  — ResampledShards seeds each (rank, worker) pair independently via
+            pytorch_worker_seed (reads RANK/WORLD_SIZE/worker.id). No explicit
+            split_by_node needed; each worker draws its own infinite random stream.
+  Val    — SimpleShardList with split_by_worker only. split_by_node is intentionally
+            absent: with world_size > shard_count some ranks get zero shards and
+            finish evaluate_epoch instantly, causing an NCCL all_reduce timeout while
+            other ranks are still iterating. All ranks evaluate the full val set
+            instead (weights are identical, so val_acc is the same on every rank).
 """
 
 from __future__ import annotations
@@ -77,13 +83,11 @@ def make_streaming_loader(
         return video, label_tensor
 
     if is_train:
-        # ResampledShards resamples shards with replacement → infinite iterator.
-        # Combined with islice(train_loader, steps_per_epoch) in train.py, all DDP
-        # ranks run exactly steps_per_epoch backward passes regardless of shard count.
+        # ResampledShards seeds each (rank, worker) independently — no split_by_node
+        # or split_by_worker needed. islice(train_loader, steps_per_epoch) in train.py
+        # caps every DDP rank at the same number of steps.
         pipeline_steps: list = [
             wds.ResampledShards(_resolve_shards(shard_pattern)),
-            wds.split_by_node,
-            wds.split_by_worker,
             wds.tarfile_to_samples(),
             wds.shuffle(1000),
             wds.map(decode_sample),
@@ -92,7 +96,6 @@ def make_streaming_loader(
     else:
         pipeline_steps = [
             wds.SimpleShardList(_resolve_shards(shard_pattern)),
-            wds.split_by_node,
             wds.split_by_worker,
             wds.tarfile_to_samples(),
             wds.map(decode_sample),

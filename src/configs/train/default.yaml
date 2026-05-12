@@ -8,5 +8,5 @@ training:
   checkpoint_path: ${hydra:runtime.cwd}/best_model.pt
   device: cuda
   dist_backend: nccl
-  nccl_timeout_sec: 120  # fail fast; default 600s caused 10-min hangs before elastic restart
+  nccl_timeout_sec: 600  # 18-node Ethernet/NFS needs headroom; 120s caused spurious timeouts
   steps_per_epoch: 0     # 0 = no cap (non-streaming); set per-experiment for WDS streaming
