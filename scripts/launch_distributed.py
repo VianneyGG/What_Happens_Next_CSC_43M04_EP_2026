@@ -13,7 +13,13 @@ Usage:
         --rdzv_host bugatti.polytechnique.fr \\
         -- experiment=baseline_from_scratch data=vianney_wds_nfs
 
-    # Skip code sync (editing directly on the cluster):
+    # On-cluster launch (SSH into bugatti, then run directly — rsync and rdzv_host auto-configured):
+    python scripts/launch_distributed.py \\
+        --hosts scripts/hosts.txt \\
+        -- experiment=baseline_from_scratch data=vianney_wds_nfs
+    # → rsync skipped (NFS already shared), rdzv_host auto-set to bugatti.polytechnique.fr
+
+    # Skip code sync explicitly (editing directly on the cluster):
     python scripts/launch_distributed.py \\
         --hosts scripts/hosts.txt \\
         --rdzv_host bugatti.polytechnique.fr \\
@@ -49,6 +55,7 @@ import argparse
 import dataclasses
 import shlex
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -179,8 +186,9 @@ def main() -> None:
     parser.add_argument(
         "--rdzv_host",
         default=None,
-        help="Hostname/IP for the c10d rendezvous endpoint (default: first host in hosts file). "
-             "Set to the login node hostname when running from tmux there: --rdzv_host $(hostname)",
+        help="Hostname/IP for the c10d rendezvous endpoint (default: first compute node, "
+             "or socket.getfqdn() when launched from the cluster workdir). "
+             "Set explicitly with --rdzv_host $(hostname -f) to pin a specific node.",
     )
     parser.add_argument(
         "--workdir",
@@ -228,6 +236,18 @@ def main() -> None:
         help="Model name — passed as Hydra override model=<name> (default: cnn_baseline)")
     parser.add_argument("train_args", nargs=argparse.REMAINDER, help="Hydra overrides passed to the script")
     args = parser.parse_args()
+
+    # Auto-detect on-cluster launch: script resolves to the same directory as workdir (NFS).
+    # From WSL: /home/lev/Projects/... ≠ /users/eleves-b/... → off-cluster, no change.
+    # From cluster: both resolve to the NFS workdir → skip rsync, use local hostname as rdzv_host.
+    _on_cluster = Path(__file__).parent.parent.resolve() == Path(args.workdir).resolve()
+    if _on_cluster:
+        if not args.no_sync:
+            print("On-cluster launch detected (script in workdir) — skipping rsync.")
+            args.no_sync = True
+        if args.rdzv_host is None:
+            args.rdzv_host = socket.getfqdn()
+            print(f"  rdzv_host auto-set to {args.rdzv_host}")
 
     hosts = parse_hosts(args.hosts)
     if not hosts:
