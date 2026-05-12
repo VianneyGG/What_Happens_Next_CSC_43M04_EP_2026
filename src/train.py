@@ -383,14 +383,19 @@ def main(cfg: DictConfig) -> None:
     checkpoint_path = Path(cfg.training.checkpoint_path).resolve()
     if checkpoint_path.exists():
         ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
-        raw_model = model.module if is_dist else model
-        raw_model.load_state_dict(ckpt["model_state_dict"])
-        if "optimizer_state_dict" in ckpt:
-            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-        start_epoch = ckpt.get("epoch", 0) + 1
-        best_val_accuracy = float(ckpt.get("best_val_accuracy", ckpt.get("val_accuracy", 0.0)))
-        if rank == 0:
-            print(f"Resumed from checkpoint (epoch {start_epoch}, best_val_acc={best_val_accuracy:.4f})")
+        ckpt_model = ckpt.get("model_name", "unknown")
+        if ckpt_model != cfg.model.name:
+            if rank == 0:
+                print(f"Checkpoint model ({ckpt_model}) != current model ({cfg.model.name}); skipping resume.")
+        else:
+            raw_model = model.module if is_dist else model
+            raw_model.load_state_dict(ckpt["model_state_dict"])
+            if "optimizer_state_dict" in ckpt:
+                optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+            start_epoch = ckpt.get("epoch", 0) + 1
+            best_val_accuracy = float(ckpt.get("best_val_accuracy", ckpt.get("val_accuracy", 0.0)))
+            if rank == 0:
+                print(f"Resumed from checkpoint (epoch {start_epoch}, best_val_acc={best_val_accuracy:.4f})")
 
     # --- Training loop ---
     patience = int(cfg.training.get("early_stopping_patience", 0))

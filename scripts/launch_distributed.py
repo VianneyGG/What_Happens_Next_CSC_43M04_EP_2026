@@ -31,10 +31,11 @@ Requires passwordless SSH from the machine running this script to every host
 listed in hosts.txt. The torchrun command runs in --workdir on the remote node.
 
 Rendezvous host (--rdzv_host):
-  c10d TCPStore runs on this host; all compute nodes connect to it on --port.
-  Default: hosts[0] (first compute node — a SPOF if that node is preempted).
-  Recommended: set to bugatti.polytechnique.fr (login node, always up).
-  Requires port 29500 open on that host from compute nodes.
+  torchrun's c10d backend starts its own TCPStore on this host — no external
+  coordinator is started or needed. rdzv_host MUST be one of the compute nodes
+  (the torchrun process there acts as the store server). If the specified host
+  is excluded from compute (e.g. insufficient GPU memory), the launcher falls
+  back to the first eligible compute node automatically.
 
 Code sync (default):
   rsyncs the local repo to master:{workdir}. NFS propagates to all nodes instantly.
@@ -147,19 +148,6 @@ def stream_output(proc: subprocess.Popen, prefix: str) -> None:
     for line in proc.stdout:
         print(f"{prefix} {line}", end="", flush=True)
 
-
-def check_rdzv_reachable(host: str, rdzv_host: str, rdzv_port: int, timeout: int = 5) -> bool:
-    """Return True if host can make a TCP connection to rdzv_host:rdzv_port."""
-    try:
-        r = subprocess.run(
-            ["ssh", "-o", "BatchMode=yes", "-o", f"ConnectTimeout={timeout}",
-             "-o", "StrictHostKeyChecking=no",
-             host, f"nc -z -w{timeout} {rdzv_host} {rdzv_port} && echo OK || echo FAIL"],
-            capture_output=True, text=True, timeout=timeout + 2,
-        )
-    except subprocess.TimeoutExpired:
-        return False
-    return "OK" in r.stdout
 
 
 # ---------------------------------------------------------------------------
@@ -325,73 +313,20 @@ def main() -> None:
     else:
         print("Skipping code sync (--no_sync).")
 
-    # --- Optional: TCPStore coordinator for external rdzv_host ---
-    # When --rdzv_host points to a host not in the compute list (e.g. login node),
-    # nothing will listen on rdzv_host:port unless we start a store there explicitly.
-    rdzv_coord_proc: subprocess.Popen | None = None
+    # torchrun's c10d backend manages its own TCPStore on rdzv_host — no external
+    # coordinator is needed or compatible. When --rdzv_host is not a compute node
+    # (e.g. login node excluded due to low GPU memory), fall back to the first
+    # compute node so that the torchrun process there serves the store.
     if args.rdzv_host:
         good_hostnames = {info.host.split("@")[-1] for info in good}
         if args.rdzv_host not in good_hostnames:
-            # Derive ssh user from hosts list (entries are user@host); fall back to bare hostname.
-            cluster_user = hosts[0].split("@")[0] if "@" in hosts[0] else None
-            rdzv_ssh_target = f"{cluster_user}@{args.rdzv_host}" if cluster_user else args.rdzv_host
-            coord_py = (
-                f"import torch.distributed as dist, signal; "
-                f"dist.TCPStore('{args.rdzv_host}', {args.port}, -1, True); "
-                f"signal.pause()"
+            fallback = good[0].host.split("@")[-1]
+            print(
+                f"  WARNING: --rdzv_host={args.rdzv_host} is not a compute node "
+                f"(excluded or not in hosts file). Falling back to {fallback}.",
+                file=sys.stderr,
             )
-            venv_python = str(Path(args.torchrun).parent / "python")
-            coord_cmd = f"cd {shlex.quote(args.workdir)} && {venv_python} -c {shlex.quote(coord_py)}"
-            rdzv_coord_proc = subprocess.Popen(
-                ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes",
-                 rdzv_ssh_target, coord_cmd],
-                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-            )
-            time.sleep(3.0)
-            if rdzv_coord_proc.poll() is not None:
-                err = rdzv_coord_proc.stderr.read().decode().strip()
-                sys.exit(
-                    f"Failed to start TCPStore coordinator on {args.rdzv_host}:{args.port}\n"
-                    f"  ssh target: {rdzv_ssh_target}\n"
-                    f"  stderr: {err or '(empty)'}\n"
-                    f"  coord_cmd: {coord_cmd}"
-                )
-            print(f"  rdzv coordinator on {args.rdzv_host}:{args.port}")
-            # Filter out nodes that are firewall-blocked from reaching the coordinator
-            with ThreadPoolExecutor(max_workers=len(good)) as ex:
-                reachable = list(ex.map(
-                    lambda info: check_rdzv_reachable(info.host, args.rdzv_host, args.port),
-                    good,
-                ))
-            for info, ok in zip(good, reachable):
-                if not ok:
-                    print(f"  SKIP  {info.host} — can't reach rdzv {args.rdzv_host}:{args.port}", file=sys.stderr)
-            prev_count = len(good)
-            reachable_good = [info for info, ok in zip(good, reachable) if ok]
-            dropped = prev_count - len(reachable_good)
-            filter_note = f"  ({dropped} unreachable)" if dropped else ""
-            print(f"  {len(reachable_good)}/{prev_count} nodes reach rdzv{filter_note}")
-            if not reachable_good:
-                # Bugatti is firewalled from all compute nodes — kill external coordinator
-                # and fall back to using the first compute node as rdzv_host instead.
-                rdzv_coord_proc.kill()
-                rdzv_coord_proc = None
-                fallback = good[0].host.split("@")[-1]
-                print(
-                    f"  WARNING: {args.rdzv_host}:{args.port} unreachable from all nodes "
-                    f"(firewall). Falling back to compute node {fallback} as rdzv_host.",
-                    file=sys.stderr,
-                )
-                rdzv_host = fallback
-                # All good nodes are usable — no reachability filter needed.
-            else:
-                good = reachable_good
-                hosts = [info.host for info in good]
-                nnodes = len(hosts)
-                if min_nodes > nnodes:
-                    min_nodes = nnodes
-                master = hosts[0]
-                master_host = master.split("@")[-1]
+            rdzv_host = fallback
 
     torchrun_cmd = (
         f"cd {shlex.quote(args.workdir)} && "
@@ -435,11 +370,6 @@ def main() -> None:
         if http_proc is not None:
             try:
                 http_proc.kill()
-            except ProcessLookupError:
-                pass
-        if rdzv_coord_proc is not None:
-            try:
-                rdzv_coord_proc.kill()
             except ProcessLookupError:
                 pass
 
@@ -496,9 +426,6 @@ def main() -> None:
         http_proc.kill()
         print("HTTP server stopped.")
 
-    if rdzv_coord_proc is not None:
-        rdzv_coord_proc.kill()
-        print("rdzv coordinator stopped.")
 
     failed = [(hosts[i], code) for i, code in enumerate(exit_codes) if code != 0]
     succeeded = sum(1 for code in exit_codes if code == 0)
