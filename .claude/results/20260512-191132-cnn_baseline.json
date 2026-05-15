@@ -1,0 +1,11 @@
+{
+  "timestamp": "20260512-191132",
+  "experiment": "cnn_baseline",
+  "best_val_accuracy": 0.0581,
+  "epochs_trained": 20,
+  "lr": 0.0001,
+  "batch_size": 8,
+  "num_frames": 4,
+  "world_size": 3,
+  "warning": "TOP1_LOW"
+}

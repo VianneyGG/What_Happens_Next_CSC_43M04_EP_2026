@@ -1,22 +1,25 @@
 # @package _global_
-# WebDataset streaming from NFS home directory (no HTTP server required).
-# All compute nodes share the NFS home, so shards written there are readable everywhere.
+# WebDataset streaming from NFS home directory — readable by all compute nodes.
 #
-# Conversion (run once on a machine with /Data/ access, e.g. the login node):
-#   cd /users/eleves-b/2024/vianney.gauthier/Cours/ModalDL/What_Happens_Next_CSC_43M04_EP_2026
+# Shards already exist at processed_data_wds/ (90 train, 14 val).
+# Re-convert if needed:
 #   uv run python src/misc/convert_to_webdataset.py \
 #     --input_dir /Data/vianney.gauthier/processed_data \
 #     --output_dir processed_data_wds
 #
-# Launch (glob picks up all shards automatically):
-#   uv run scripts/launch_distributed.py --hosts scripts/hosts_reachable.txt \
-#     -- experiment=baseline_from_scratch data=vianney_wds_nfs
+# Launch:
+#   sbatch --nodes=N scripts/slurm_train.sh experiment=tsm_from_scratch data=vianney_wds_nfs
 
 dataset:
-  train_shards: "/users/eleves-b/2024/vianney.gauthier/Cours/ModalDL/What_Happens_Next_CSC_43M04_EP_2026/processed_data_wds/train/*.tar"
-  val_shards: "/users/eleves-b/2024/vianney.gauthier/Cours/ModalDL/What_Happens_Next_CSC_43M04_EP_2026/processed_data_wds/val/*.tar"
+  train_shards: "/users/eleves-b/2024/vianney.gauthier/Cours/ModalDL/What_Happens_Next_CSC_43M04_EP_2026/processed_data_wds/train/shard-{000000..000089}.tar"
+  val_shards: "/users/eleves-b/2024/vianney.gauthier/Cours/ModalDL/What_Happens_Next_CSC_43M04_EP_2026/processed_data_wds/val/shard-{000000..000013}.tar"
   num_frames: 4
   val_ratio: 0.2
   seed: 42
   max_samples: null
   streaming: true
+
+training:
+  steps_per_epoch: 200   # ~90 shards × 500 samples / batch_size=8 / 30 nodes ≈ 188; round up
+  # num_workers cannot be set here: experiment YAMLs load after data and override it.
+  # Pass training.num_workers=1 explicitly on the CLI for NFS streaming jobs.

@@ -9,7 +9,7 @@ dataset:
 
 training:
   epochs: 75
-  early_stopping_patience: 10
+  early_stopping_patience: 0
   batch_size: 16
   num_workers: 4
   device: cuda

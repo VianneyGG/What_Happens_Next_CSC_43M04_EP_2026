@@ -49,6 +49,12 @@ def load_model_from_checkpoint(checkpoint: Dict[str, Any], device: torch.device)
 @hydra.main(version_base=None, config_path="configs", config_name="config")
 def main(cfg: DictConfig) -> None:
     # --- Distributed setup ---
+    # Map SLURM per-task vars → PyTorch env:// vars when launched via plain srun (no torchrun).
+    if "RANK" not in os.environ and "SLURM_PROCID" in os.environ:
+        os.environ["RANK"] = os.environ["SLURM_PROCID"]
+        os.environ["WORLD_SIZE"] = os.environ.get("SLURM_NTASKS", "1")
+        os.environ["LOCAL_RANK"] = os.environ.get("SLURM_LOCALID", "0")
+
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     rank = int(os.environ.get("RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))

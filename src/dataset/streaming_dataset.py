@@ -36,6 +36,10 @@ def _resolve_shards(pattern: str | list[str]) -> str | list[str]:
         return pattern
     if pattern.startswith("http"):
         return pattern
+    # Brace-expansion patterns (e.g. shard-{000000..000089}.tar) are passed directly
+    # to WebDataset which expands them locally — no NFS stat calls, safe for 30+ nodes.
+    if "{" in pattern:
+        return pattern
     paths = sorted(_glob.glob(pattern))
     if not paths:
         raise FileNotFoundError(f"No shards found: {pattern}")
@@ -89,7 +93,7 @@ def make_streaming_loader(
         pipeline_steps: list = [
             wds.ResampledShards(_resolve_shards(shard_pattern)),
             wds.tarfile_to_samples(),
-            wds.shuffle(1000),
+            wds.shuffle(100),
             wds.map(decode_sample),
             wds.batched(batch_size, collation_fn=torch.utils.data.default_collate, partial=False),
         ]
@@ -109,4 +113,5 @@ def make_streaming_loader(
         batch_size=None,  # batching handled by wds.batched()
         num_workers=num_workers,
         pin_memory=True,
+        persistent_workers=(num_workers > 0),
     )

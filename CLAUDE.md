@@ -12,9 +12,9 @@ uv venv --seed && uv sync --group dev
 uv run pytest                                          # all tests
 uv run pytest tests/test_video_dataset.py              # single file
 uv run ruff check . && uv run ruff format .
-python src/train.py experiment=baseline_from_scratch +data=vianney
-python src/evaluate.py training.checkpoint_path=src/best_model.pt +data=vianney
-python src/create_submission.py training.checkpoint_path=src/best_model.pt +data=vianney
+python src/train.py experiment=baseline_from_scratch data=vianney
+python src/evaluate.py training.checkpoint_path=src/best_model.pt data=vianney
+python src/create_submission.py training.checkpoint_path=src/best_model.pt data=vianney
 ```
 
 ## Architecture
@@ -82,6 +82,6 @@ Flag Top-1 < 0.5 with ⚠. `train.py` auto-writes `.claude/results/YYYYMMDD-<exp
 ## Configuration
 
 ```bash
-python src/train.py experiment=baseline_pretrained +data=vianney training.lr=0.001
+python src/train.py experiment=baseline_pretrained data=vianney training.lr=0.001
 ```
 Data paths in `src/configs/data/vianney.yaml` — edit there, never in source.

@@ -1,0 +1,11 @@
+{
+  "timestamp": "20260514-181538",
+  "experiment": "tsm",
+  "best_val_accuracy": 0.0776,
+  "epochs_trained": 3,
+  "lr": 0.01,
+  "batch_size": 16,
+  "num_frames": 4,
+  "world_size": 5,
+  "warning": "TOP1_LOW"
+}

@@ -217,3 +217,5 @@ scripts/hosts_reachable.txt
 scripts/ssh_config_snippet.txt
 scripts/ssh_setup.log
 processed_data_wds/
+slurm-*.out
+slurm-*.err

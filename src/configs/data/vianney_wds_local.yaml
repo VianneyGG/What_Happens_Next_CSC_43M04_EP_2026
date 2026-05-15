@@ -1,0 +1,18 @@
+# @package _global_
+# WebDataset streaming from per-node local scratch (staged by scripts/stage_shards.sh).
+#
+# Usage in slurm_train.sh:
+#   STAGE_ROOT=${TMPDIR:-/tmp}/wds_shards
+#   srun --ntasks-per-node=1 bash scripts/stage_shards.sh /nfs/shards "$STAGE_ROOT"
+#   srun uv run python src/train.py data=vianney_wds_local \
+#       "dataset.train_shards=$STAGE_ROOT/train/*.tar" \
+#       "dataset.val_shards=$STAGE_ROOT/val/*.tar"
+
+dataset:
+  train_shards: "OVERRIDE_IN_BATCH_SCRIPT"
+  val_shards: "OVERRIDE_IN_BATCH_SCRIPT"
+  num_frames: 4
+  val_ratio: 0.2
+  seed: 42
+  max_samples: null
+  streaming: true

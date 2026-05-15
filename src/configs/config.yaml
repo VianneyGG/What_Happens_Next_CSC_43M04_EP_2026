@@ -2,8 +2,8 @@
 # Run from `src/`:  python train.py experiment=cnn_lstm
 defaults:
   - model: cnn_baseline
-  - data: default
   - train: default
+  - data: default
   - experiment: baseline_from_scratch
   - _self_
 

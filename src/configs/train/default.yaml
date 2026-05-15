@@ -10,3 +10,13 @@ training:
   dist_backend: nccl
   nccl_timeout_sec: 600  # 18-node Ethernet/NFS needs headroom; 120s caused spurious timeouts
   steps_per_epoch: 0     # 0 = no cap (non-streaming); set per-experiment for WDS streaming
+  grad_compress: ""      # "" | "fp16" (2× bandwidth) | "powersgd" (50–200× compression)
+  accum_steps: 1         # gradient accumulation steps; >1 requires no_sync() — already handled
+  resume: true           # false = skip loading checkpoint (use for benchmark/test runs)
+  local_sgd_period: 0    # 0 = standard DDP gradient sync; N > 0 = Local SGD (param avg every N opt steps, no DDP sync)
+  compile: false         # torch.compile before DDP wrap; 20-50% compute speedup, slow first epoch
+  compile_mode: null     # null=default | reduce-overhead (CUDA Graphs, needs drop_last=True) | max-autotune
+  channels_last: false   # channels_last memory format; skip for TSM (non-standard 5D→4D reshape)
+  nccl_env:
+    NCCL_IB_DISABLE: "1"          # skip InfiniBand probe — eliminates multi-second stall on init
+    # NCCL_SOCKET_NTHREADS/NSOCKS_PERTHREAD tested (job 377) and found to slow 2-node from ~2s to 6s/step

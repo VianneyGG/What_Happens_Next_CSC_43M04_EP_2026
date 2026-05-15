@@ -13,17 +13,23 @@ add more overrides). You can still override any key, e.g. ``training.epochs=10``
 Training uses ``dataset.train_dir`` and ``split_train_val`` for an internal train/val
 split; the dedicated ``dataset.val_dir`` is for ``evaluate.py`` only.
 
-Multi-node distributed training (torchrun):
-    torchrun --nproc_per_node=4 train.py experiment=baseline_from_scratch +data=vianney
-    # or use scripts/launch_distributed.py for multi-node SSH dispatch
+Multi-node distributed training:
+    # Single-node multi-GPU (torchrun):
+    torchrun --nproc_per_node=4 train.py experiment=baseline_from_scratch data=vianney
+    # Multi-node via SLURM:
+    sbatch scripts/slurm_train.sh experiment=baseline_from_scratch data=vianney
 """
 
 from __future__ import annotations
 
+import contextlib
 import itertools
 import json
 import os
 import sys
+import warnings
+warnings.filterwarnings("ignore", message="This DataLoader will create", category=UserWarning)
+warnings.filterwarnings("ignore", message="Grad strides do not match bucket view strides")
 from datetime import datetime, timedelta
 import math
 from pathlib import Path
@@ -161,14 +167,24 @@ def train_one_epoch(
     grad_clip: float = 0.0,
     accum_steps: int = 1,
     total_steps: Optional[int] = None,
+    rank: int = 0,
+    log_every: int = 10,
+    local_sgd_period: int = 0,
 ) -> Tuple[float, float]:
+    import time as _step_time
     model.train()
     running_loss = 0.0
     correct = 0
     total = 0
+    _step_t = _step_time.monotonic()
+    _opt_steps = 0
+    local_sgd_active = local_sgd_period > 0
 
     optimizer.zero_grad()
     for step, (video_batch, labels) in enumerate(data_loader):
+        if log_every and step % log_every == 0 and rank == 0:
+            elapsed = _step_time.monotonic() - _step_t
+            print(f"[train step {step}  elapsed={elapsed:.1f}s  samples={total}]", flush=True)
         video_batch = video_batch.to(device)
         labels = labels.to(device)
         if total_steps is not None:
@@ -179,19 +195,28 @@ def train_one_epoch(
             except TypeError:
                 is_last = False  # IterableDataset (streaming) has no len()
 
-        if scaler is not None:
-            with torch.amp.autocast("cuda"):
+        is_accum_step = (step + 1) % accum_steps == 0 or is_last
+        # Local SGD: bypass DDP gradient sync; average parameters periodically instead
+        is_sync_step = is_accum_step and not local_sgd_active
+        no_sync_ctx = (
+            model.no_sync()
+            if not is_sync_step and hasattr(model, "no_sync")
+            else contextlib.nullcontext()
+        )
+        with no_sync_ctx:
+            if scaler is not None:
+                with torch.amp.autocast("cuda"):
+                    logits = model(video_batch)
+                    loss = loss_fn(logits, labels) / accum_steps
+                scaler.scale(loss).backward()
+            else:
                 logits = model(video_batch)
                 loss = loss_fn(logits, labels) / accum_steps
-            scaler.scale(loss).backward()
-        else:
-            logits = model(video_batch)
-            loss = loss_fn(logits, labels) / accum_steps
-            loss.backward()
+                loss.backward()
 
         running_loss += float(loss.item()) * accum_steps * labels.size(0)
 
-        if (step + 1) % accum_steps == 0 or is_last:
+        if is_accum_step:
             if scaler is not None:
                 if grad_clip > 0.0:
                     scaler.unscale_(optimizer)
@@ -203,6 +228,11 @@ def train_one_epoch(
                     torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
                 optimizer.step()
             optimizer.zero_grad()
+            if local_sgd_active:
+                _opt_steps += 1
+                if _opt_steps % local_sgd_period == 0:
+                    for p in model.parameters():
+                        dist.all_reduce(p.data, op=dist.ReduceOp.AVG)
 
         correct += int((logits.argmax(dim=1) == labels).sum().item())
         total += labels.size(0)
@@ -249,16 +279,36 @@ def evaluate_epoch(
 @hydra.main(version_base=None, config_path="configs", config_name="config")
 def main(cfg: DictConfig) -> None:
     # --- Distributed setup ---
+    # Map SLURM per-task vars → PyTorch env:// vars when launched via plain srun (no torchrun).
+    # No-op when torchrun already injected RANK/WORLD_SIZE/LOCAL_RANK.
+    if "RANK" not in os.environ and "SLURM_PROCID" in os.environ:
+        os.environ["RANK"] = os.environ["SLURM_PROCID"]
+        os.environ["WORLD_SIZE"] = os.environ.get("SLURM_NTASKS", "1")
+        os.environ["LOCAL_RANK"] = os.environ.get("SLURM_LOCALID", "0")
+        # MASTER_ADDR / MASTER_PORT must be exported by the batch script before srun
+
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     rank = int(os.environ.get("RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     is_dist = world_size > 1
 
+    for key, val in (cfg.training.get("nccl_env") or {}).items():
+        os.environ.setdefault(str(key), str(val))
+
+    import socket, time as _time
+    _t0 = _time.monotonic()
+    _host = socket.gethostname().split(".")[0]
+    def _log(msg: str) -> None:
+        if rank == 0:
+            print(f"[{_time.monotonic() - _t0:6.1f}s] {msg}", flush=True)
+
+    _log(f"init_process_group start (node={socket.gethostname()})")
     if is_dist:
         dist.init_process_group(
             backend=cfg.training.get("dist_backend", "nccl"),
             timeout=timedelta(seconds=int(cfg.training.get("nccl_timeout_sec", 120))),
         )
+    _log("init_process_group done")
 
     if rank == 0:
         print(
@@ -280,6 +330,7 @@ def main(cfg: DictConfig) -> None:
     if device_str == "cuda":
         torch.cuda.set_device(local_rank)
         device = torch.device(f"cuda:{local_rank}")
+        torch.backends.cudnn.benchmark = True
     else:
         device = torch.device(device_str)
 
@@ -290,6 +341,7 @@ def main(cfg: DictConfig) -> None:
 
     if cfg.dataset.get("streaming", False):
         from dataset.streaming_dataset import make_streaming_loader
+        _log("train_loader create start")
         train_loader = make_streaming_loader(
             shard_pattern=cfg.dataset.train_shards,
             num_frames=num_frames,
@@ -306,6 +358,7 @@ def main(cfg: DictConfig) -> None:
             num_workers=int(cfg.training.num_workers),
             is_train=False,
         )
+        _log("loaders created")
     else:
         train_dir = Path(cfg.dataset.train_dir).resolve()
         all_samples = collect_video_samples(train_dir)
@@ -340,27 +393,70 @@ def main(cfg: DictConfig) -> None:
             val_dataset, num_replicas=world_size, rank=rank, shuffle=False
         ) if is_dist else None
 
+        _nw = int(cfg.training.num_workers)
         train_loader = DataLoader(
             train_dataset,
             batch_size=int(cfg.training.batch_size),
             shuffle=(train_sampler is None),
             sampler=train_sampler,
-            num_workers=int(cfg.training.num_workers),
+            num_workers=_nw,
             pin_memory=(device.type == "cuda"),
+            persistent_workers=(_nw > 0),
+            prefetch_factor=(2 if _nw > 0 else None),
+            drop_last=True,
         )
         val_loader = DataLoader(
             val_dataset,
             batch_size=int(cfg.training.batch_size),
             shuffle=False,
             sampler=val_sampler,
-            num_workers=int(cfg.training.num_workers),
+            num_workers=_nw,
             pin_memory=(device.type == "cuda"),
+            persistent_workers=(_nw > 0),
+            prefetch_factor=(2 if _nw > 0 else None),
         )
 
     # --- Model / optimizer / scheduler ---
+    _log("build_model start")
     model = build_model(cfg).to(device)
+    if cfg.training.get("channels_last", False) and device.type == "cuda":
+        model = model.to(memory_format=torch.channels_last)
+    if cfg.training.get("compile", False):
+        compile_mode = cfg.training.get("compile_mode", None) or None
+        model = torch.compile(model, mode=compile_mode)
+        if rank == 0:
+            print(f"torch.compile active (mode={compile_mode!r})", flush=True)
     if is_dist:
-        model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+        # static_graph=True is incompatible with no_sync() (used when accum_steps > 1)
+        use_static_graph = cfg.training.get("grad_compress", "") != "powersgd" and int(cfg.training.get("accum_steps", 1)) <= 1
+        # gradient_as_bucket_view=True causes stride mismatch warnings with torch.compile
+        use_bucket_view = not cfg.training.get("compile", False)
+        model = DDP(
+            model,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            static_graph=use_static_graph,
+            gradient_as_bucket_view=use_bucket_view,
+            bucket_cap_mb=200,
+        )
+        _grad_compress = cfg.training.get("grad_compress", "")
+        if _grad_compress == "fp16":
+            from torch.distributed.algorithms.ddp_comm_hooks.default_hooks import fp16_compress_hook
+            model.register_comm_hook(None, fp16_compress_hook)
+            if rank == 0:
+                print("Gradient compression: fp16 hook active (2× bandwidth reduction)", flush=True)
+        elif _grad_compress == "powersgd":
+            from torch.distributed.algorithms.ddp_comm_hooks.powerSGD_hook import PowerSGDState, powerSGD_hook
+            state = PowerSGDState(
+                process_group=None,
+                matrix_approximation_rank=1,
+                start_powerSGD_iter=100,
+                min_compression_rate=2,
+            )
+            model.register_comm_hook(state, powerSGD_hook)
+            if rank == 0:
+                print("Gradient compression: PowerSGD rank-1 hook active", flush=True)
+    _log("model ready (DDP wrapped)")
 
     optimizer = build_optimizer(model, cfg)
     try:
@@ -381,7 +477,7 @@ def main(cfg: DictConfig) -> None:
     best_val_accuracy = 0.0
     start_epoch = 0
     checkpoint_path = Path(cfg.training.checkpoint_path).resolve()
-    if checkpoint_path.exists():
+    if cfg.training.get("resume", True) and checkpoint_path.exists():
         ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
         ckpt_model = ckpt.get("model_name", "unknown")
         if ckpt_model != cfg.model.name:
@@ -389,9 +485,26 @@ def main(cfg: DictConfig) -> None:
                 print(f"Checkpoint model ({ckpt_model}) != current model ({cfg.model.name}); skipping resume.")
         else:
             raw_model = model.module if is_dist else model
-            raw_model.load_state_dict(ckpt["model_state_dict"])
+            if hasattr(raw_model, "_orig_mod"):  # torch.compile wraps in OptimizedModule
+                raw_model = raw_model._orig_mod
+            state_dict = ckpt["model_state_dict"]
+            # Strip _orig_mod. prefix from checkpoints saved before the compile/save fix
+            if any(k.startswith("_orig_mod.") for k in state_dict):
+                state_dict = {k[len("_orig_mod."):]: v for k, v in state_dict.items()}
+            raw_model.load_state_dict(state_dict)
             if "optimizer_state_dict" in ckpt:
-                optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+                ckpt_opt = ckpt.get("optimizer_name", None)
+                cur_opt = cfg.training.get("optimizer", "adam").lower()
+                if ckpt_opt is not None and ckpt_opt == cur_opt:
+                    try:
+                        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+                    except (ValueError, KeyError) as e:
+                        if rank == 0:
+                            print(f"Optimizer state incompatible ({e}); starting optimizer from scratch.")
+                else:
+                    if rank == 0:
+                        reason = f"ckpt={ckpt_opt}" if ckpt_opt else "no optimizer_name in checkpoint"
+                        print(f"Skipping optimizer state ({reason} vs current={cur_opt}).")
             start_epoch = ckpt.get("epoch", 0) + 1
             best_val_accuracy = float(ckpt.get("best_val_accuracy", ckpt.get("val_accuracy", 0.0)))
             if rank == 0:
@@ -414,16 +527,19 @@ def main(cfg: DictConfig) -> None:
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
 
+        _log(f"epoch {epoch} train_one_epoch start")
+        local_sgd_period = int(cfg.training.get("local_sgd_period", 0))
         train_loss, train_acc = train_one_epoch(
             model, itertools.islice(train_loader, epoch_step_cap),
             loss_fn, optimizer, device, scaler, grad_clip, accum_steps,
-            total_steps=epoch_step_cap,
+            total_steps=epoch_step_cap, rank=rank, log_every=10,
+            local_sgd_period=local_sgd_period,
         )
+        _log(f"epoch {epoch} train_one_epoch done  loss={train_loss:.4f}")
 
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
-
+        _log(f"epoch {epoch} evaluate_epoch start")
         val_loss, val_acc = evaluate_epoch(model, val_loader, loss_fn, device, scaler)
+        _log(f"epoch {epoch} evaluate_epoch done  val_acc={val_acc:.4f}")
 
         # Average metrics across all ranks for consistent logging and checkpoint decisions
         if is_dist:
@@ -447,6 +563,8 @@ def main(cfg: DictConfig) -> None:
             epochs_without_improvement = 0
             if rank == 0:
                 raw_model = model.module if is_dist else model
+                if hasattr(raw_model, "_orig_mod"):  # torch.compile wraps in OptimizedModule
+                    raw_model = raw_model._orig_mod
                 payload: Dict[str, Any] = {
                     "model_state_dict": raw_model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
@@ -457,6 +575,7 @@ def main(cfg: DictConfig) -> None:
                     "num_frames": num_frames,
                     "val_accuracy": val_acc,
                     "config": OmegaConf.to_container(cfg, resolve=True),
+                    "optimizer_name": cfg.training.get("optimizer", "adam").lower(),
                 }
                 # backward-compat fields for existing loaders
                 if cfg.model.name in ("cnn_baseline", "cnn_lstm"):

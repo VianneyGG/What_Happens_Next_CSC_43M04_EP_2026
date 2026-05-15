@@ -9,6 +9,7 @@ node-level distribution, training integration, HTTP serving, and SSH command gen
 from __future__ import annotations
 
 import io
+import itertools
 import os
 import socket
 import subprocess
@@ -31,7 +32,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from dataset.streaming_dataset import make_streaming_loader
 from misc.convert_to_webdataset import run_conversion
-from scripts.launch_distributed import build_ssh_command
 from train import build_model, train_one_epoch
 
 # ---------------------------------------------------------------------------
@@ -153,7 +153,7 @@ def test_npz_contains_expected_frames(tiny_video_dir: Path, tmp_path: Path) -> N
 # ---------------------------------------------------------------------------
 
 def test_streaming_loader_tensor_shape(tiny_wds_dir: Path, simple_transform) -> None:
-    shard_pattern = str(tiny_wds_dir / "train" / "shard-{000000..000010}.tar")
+    shard_pattern = str(tiny_wds_dir / "train" / "shard-*.tar")
     loader = make_streaming_loader(
         shard_pattern=shard_pattern,
         num_frames=NUM_FRAMES,
@@ -204,16 +204,17 @@ def test_streaming_loader_all_samples_seen(tiny_wds_dir: Path, simple_transform)
 # Distributed split test
 # ---------------------------------------------------------------------------
 
-def test_split_by_node_disjoint(tiny_video_dir: Path, simple_transform) -> None:
-    """Simulate two-node split: rank 0 and rank 1 should see disjoint shards."""
-    # shard_size=1 → 1 video per shard → 6 shards total
-    out = tiny_video_dir.parent / "wds_split_test"
+def test_val_loader_all_ranks_see_full_set(tiny_video_dir: Path, simple_transform) -> None:
+    """Val loader intentionally does NOT split by node (avoids NCCL timeout when
+    world_size > shard_count). Every rank evaluates the full val set."""
+    out = tiny_video_dir.parent / "wds_val_test"
     run_conversion(
         input_dir=tiny_video_dir / "train",
         output_dir=out / "train",
         shard_size=1,
     )
     shards = sorted(str(p) for p in (out / "train").glob("shard-*.tar"))
+    expected = NUM_CLASSES * VIDEOS_PER_CLASS
 
     def collect_labels(rank: int, world_size: int) -> list[int]:
         env_backup = {k: os.environ.get(k) for k in ("RANK", "WORLD_SIZE", "LOCAL_RANK")}
@@ -240,10 +241,9 @@ def test_split_by_node_disjoint(tiny_video_dir: Path, simple_transform) -> None:
     labels_rank0 = collect_labels(rank=0, world_size=2)
     labels_rank1 = collect_labels(rank=1, world_size=2)
 
-    # Combined they should cover all samples; individually they should not overlap in count
-    assert len(labels_rank0) > 0, "Rank 0 got no samples"
-    assert len(labels_rank1) > 0, "Rank 1 got no samples"
-    assert len(labels_rank0) + len(labels_rank1) == NUM_CLASSES * VIDEOS_PER_CLASS
+    # Both ranks must see all samples (no node-level split for val)
+    assert len(labels_rank0) == expected, f"Rank 0 saw {len(labels_rank0)} samples, expected {expected}"
+    assert len(labels_rank1) == expected, f"Rank 1 saw {len(labels_rank1)} samples, expected {expected}"
 
 
 # ---------------------------------------------------------------------------
@@ -270,7 +270,9 @@ def test_streaming_train_one_epoch_cpu(tiny_wds_dir: Path, simple_transform) -> 
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
     device = torch.device("cpu")
 
-    loss, acc = train_one_epoch(model, loader, loss_fn, optimizer, device)
+    # ResampledShards is infinite; cap at 3 steps to keep the test fast.
+    steps = 3
+    loss, acc = train_one_epoch(model, itertools.islice(loader, steps), loss_fn, optimizer, device, total_steps=steps)
 
     assert isinstance(loss, float) and loss >= 0.0, f"Bad loss: {loss}"
     assert isinstance(acc, float) and 0.0 <= acc <= 1.0, f"Bad acc: {acc}"
@@ -312,33 +314,3 @@ def test_http_server_serves_shard(tiny_wds_dir: Path, simple_transform) -> None:
     finally:
         server.shutdown()
 
-
-# ---------------------------------------------------------------------------
-# Launcher SSH command test
-# ---------------------------------------------------------------------------
-
-def test_build_ssh_command_no_tunnel() -> None:
-    cmd = build_ssh_command("myhost", "echo hi")
-    assert "myhost" in cmd
-    assert "echo hi" in cmd
-    assert "-R" not in cmd
-
-
-def test_build_ssh_command_with_tunnel() -> None:
-    cmd = build_ssh_command(
-        host="myhost",
-        remote_cmd="torchrun ...",
-        remote_http_port=9888,
-        local_http_port=8888,
-    )
-    assert "-R" in cmd
-    assert "9888:localhost:8888" in cmd
-    assert "myhost" in cmd
-
-
-def test_build_ssh_command_tunnel_args_order() -> None:
-    """Tunnel flag must appear before the host argument."""
-    cmd = build_ssh_command("myhost", "cmd", remote_http_port=9888, local_http_port=8888)
-    r_idx = cmd.index("-R")
-    host_idx = cmd.index("myhost")
-    assert r_idx < host_idx, "Tunnel flag must come before the hostname"

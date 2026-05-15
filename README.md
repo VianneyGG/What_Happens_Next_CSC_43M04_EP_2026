@@ -143,35 +143,43 @@ video_12345,7
 
 `evaluate.py` and `create_submission.py` do **not** need edits: they call `build_model` with the config saved in your checkpoint.
 
-## Distributed training (multi-node)
+## Distributed training (multi-node, SLURM)
 
-The launcher in `scripts/launch_distributed.py` SSHes into each node and starts `torchrun` with the c10d rendezvous backend. Requires passwordless SSH from your local machine to every node.
+Multi-node training uses SLURM `srun` directly — no SSH or rendezvous coordinator needed.
+Each `srun` task is one Python process / one GPU; `train.py` maps SLURM env vars to PyTorch
+`env://` init automatically.
+
+### Quick start
+
+Edit `scripts/slurm_train.sh` (set `--partition`, `--nodes`, `--ntasks-per-node`, `--gres`),
+then submit:
 
 ```bash
-python scripts/launch_distributed.py \
-  --hosts scripts/hosts.txt \
-  --gpus_per_node 8 \
-  -- experiment=baseline_from_scratch data=vianney
+sbatch scripts/slurm_train.sh experiment=baseline_from_scratch data=vianney
 ```
 
-`scripts/hosts.txt` — one SSH target per line (first line becomes the rendezvous master):
-
-```text
-user@node0.cluster
-user@node1.cluster
-```
-
-Single-node multi-GPU (no SSH needed):
+Single-node multi-GPU (no SLURM):
 
 ```bash
 torchrun --nproc_per_node=4 src/train.py experiment=baseline_from_scratch data=vianney
 ```
 
-### WebDataset streaming (no data copy to remote nodes)
+### NCCL interface discovery
 
-When the dataset lives only on your local machine, convert it once to WebDataset tar shards, then let the launcher serve them over HTTP via an SSH reverse tunnel — each remote node reads `http://localhost:9888/` which is transparently forwarded back to your machine.
+On first multi-node run, add `training.nccl_env='{NCCL_DEBUG: INFO}'` and inspect the srun
+output for a line like `NCCL INFO NET/Socket : Using [0]eth0`. Then fix the interface in your
+experiment YAML to avoid re-discovery overhead:
 
-**1. Convert once (local):**
+```yaml
+# src/configs/experiment/your_experiment.yaml
+training:
+  nccl_env:
+    NCCL_SOCKET_IFNAME: eth0   # replace with interface name from the NCCL DEBUG output
+```
+
+### WebDataset streaming with local staging
+
+Convert shards once (NFS-accessible node):
 
 ```bash
 uv run python src/misc/convert_to_webdataset.py \
@@ -180,29 +188,23 @@ uv run python src/misc/convert_to_webdataset.py \
   --shard_size 500
 ```
 
-Update the shard ranges in `src/configs/data/vianney_wds.yaml` to match the counts printed by the script (e.g. `{000000..000089}` for 90 train shards).
-
-**2. Launch with streaming:**
+Add the staging step to your batch script before the training `srun`:
 
 ```bash
-python scripts/launch_distributed.py \
-  --hosts scripts/hosts.txt \
-  --gpus_per_node 8 \
-  --wds_dir processed_data_wds \
-  -- experiment=baseline_from_scratch data=vianney_wds
+STAGE_ROOT=${TMPDIR:-/tmp}/wds_shards
+srun --ntasks-per-node=1 --kill-on-bad-exit=1 \
+    bash scripts/stage_shards.sh processed_data_wds "$STAGE_ROOT"
+
+srun --kill-on-bad-exit=1 uv run python src/train.py \
+    "dataset.train_shards=$STAGE_ROOT/train/*.tar" \
+    "dataset.val_shards=$STAGE_ROOT/val/*.tar" \
+    dataset.streaming=true experiment=baseline_from_scratch
 ```
 
-The launcher starts a local HTTP server (`--http_port 8888`, default) and adds `-R 9888:localhost:8888` to each SSH connection so remote nodes read shards from `http://localhost:9888/`.
+Each node rsyncs the NFS shards to its own local scratch (`$TMPDIR` if available, else `/tmp`).
+Training reads from local disk; NFS is hit only during the staging step.
 
-**3. Distributed evaluation:**
-
-```bash
-python scripts/launch_distributed.py \
-  --hosts scripts/hosts.txt \
-  --gpus_per_node 8 \
-  --script src/evaluate.py \
-  -- training.checkpoint_path=src/best_model.pt data=vianney_wds
-```
+Alternatively use NFS shards directly (no staging) with `data=vianney_wds_nfs`.
 
 ## Tips
 
